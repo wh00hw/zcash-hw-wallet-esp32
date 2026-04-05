@@ -1,0 +1,36 @@
+# Target: ESP32-S2 (Flipper Zero WiFi Dev Board v1)
+CONFIG_IDF_TARGET="esp32s2"
+
+# Flash size (4MB on WiFi dev board)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Stack size — crypto operations need headroom
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# NVS encryption disabled (ESP32-S2 lacks HMAC eFuse support)
+# CONFIG_NVS_ENCRYPTION is not set
+
+# Watchdog — long key derivations can take seconds
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Optimize for size (limited flash)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Disable unused features to save RAM/flash
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_BT_ENABLED=n
+
+# USB CDC — the ESP32-S2 has native USB OTG
+# Two CDC interfaces: ACM0 = HWP protocol, ACM1 = debug logs
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=2
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=512
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=512
+
+# UART console on safe GPIOs (13/14) for early boot logs
+# Runtime logs are mirrored to USB CDC 1 (ACM1) after init
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=13
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=14
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
