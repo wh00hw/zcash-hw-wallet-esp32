@@ -20,6 +20,8 @@
 #include "orchard.h"
 #include "redpallas.h"
 #include "blake2b.h"
+#include "zip244.h"
+#include "orchard_signer.h"
 #include "bip39.h"
 #include "memzero.h"
 #include "led_status.h"
@@ -35,23 +37,12 @@ static volatile bool device_ready = false;
 /* Cached unified address (derived once at boot) */
 static char cached_ua[256];
 
-/* --- Signing session state (TX_OUTPUT incremental hashing) --- */
-typedef enum {
-    SESSION_IDLE,
-    SESSION_RECEIVING_OUTPUTS,
-} SessionState;
-
-static SessionState session_state = SESSION_IDLE;
-static BLAKE2B_CTX session_hash_ctx;
-static uint16_t session_outputs_received;
-static uint16_t session_outputs_total;
+/* Signing context — enforces ZIP-244 verification before signing (in libzcash) */
+static OrchardSignerCtx signer_ctx;
 
 static void session_reset(void)
 {
-    session_state = SESSION_IDLE;
-    session_outputs_received = 0;
-    session_outputs_total = 0;
-    memzero(&session_hash_ctx, sizeof(session_hash_ctx));
+    orchard_signer_reset(&signer_ctx);
 }
 
 /* Embedded Sinsemilla S-table (1024 points, 64 bytes each = 64KB) */
@@ -113,41 +104,90 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
         return;
     }
 
-    /* First output starts a new session */
-    if (out.output_index == 0) {
-        session_reset();
-        session_state = SESSION_RECEIVING_OUTPUTS;
-        session_outputs_total = out.total_outputs;
-        blake2b_Init(&session_hash_ctx, 32);
+    OrchardSignerError serr;
+
+    /* --- Metadata message (output_index == 0xFFFF) --- */
+    if (out.output_index == HWP_TX_META_INDEX) {
+        serr = orchard_signer_feed_meta(&signer_ctx, out.output_data,
+                                         out.output_data_len, out.total_outputs);
+        if (serr != SIGNER_OK) {
+            send_error(seq, HWP_ERR_BAD_FRAME, "invalid tx metadata");
+            session_reset();
+            return;
+        }
         led_status_set(LED_STATE_TX_PROGRESS);
-        ESP_LOGI(TAG, "Signing session started, expecting %d outputs", out.total_outputs);
-    }
+        ESP_LOGI(TAG, "TX metadata received, expecting %d actions", out.total_outputs);
 
-    if (session_state != SESSION_RECEIVING_OUTPUTS) {
-        send_error(seq, HWP_ERR_INVALID_STATE, "no active signing session");
+        size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+        usb_transport_send(tx_buf, len);
         return;
     }
 
-    if (out.output_index != session_outputs_received) {
-        send_error(seq, HWP_ERR_INVALID_STATE, "unexpected output index");
+    /* --- Sentinel (output_index == total_outputs): expected sighash --- */
+    if (out.output_index == out.total_outputs) {
+        if (out.output_data_len != 32) {
+            send_error(seq, HWP_ERR_BAD_FRAME, "sentinel must be 32 bytes");
+            session_reset();
+            return;
+        }
+
+        /* Log all intermediate digests for debug */
+        {
+            uint8_t hdr[32], orch[32], dbg_sighash[32];
+            Zip244ActionsState dbg_actions = signer_ctx.actions_state;
+
+            zip244_header_digest(&signer_ctx.tx_meta, hdr);
+            ESP_LOGI(TAG, "header_digest:");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, hdr, 32, ESP_LOG_INFO);
+            ESP_LOGI(TAG, "transparent_sig_digest (from companion):");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, signer_ctx.tx_meta.transparent_sig_digest, 32, ESP_LOG_INFO);
+            ESP_LOGI(TAG, "sapling_digest (from companion):");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, signer_ctx.tx_meta.sapling_digest, 32, ESP_LOG_INFO);
+
+            zip244_orchard_digest(&dbg_actions, &signer_ctx.tx_meta, orch);
+            ESP_LOGI(TAG, "orchard_digest (computed by device):");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, orch, 32, ESP_LOG_INFO);
+
+            /* Recompute full sighash */
+            Zip244ActionsState dbg_actions2 = signer_ctx.actions_state;
+            zip244_shielded_sighash(&signer_ctx.tx_meta, &dbg_actions2, dbg_sighash);
+            ESP_LOGI(TAG, "Device sighash:");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, dbg_sighash, 32, ESP_LOG_INFO);
+            ESP_LOGI(TAG, "Companion sighash:");
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, out.output_data, 32, ESP_LOG_INFO);
+        }
+
+        serr = orchard_signer_verify(&signer_ctx, out.output_data);
+        if (serr == SIGNER_ERR_SIGHASH_MISMATCH) {
+            ESP_LOGE(TAG, "ZIP-244 sighash MISMATCH");
+            send_error(seq, HWP_ERR_SIGHASH_MISMATCH, "ZIP-244 sighash mismatch");
+            return;
+        }
+        if (serr != SIGNER_OK) {
+            ESP_LOGE(TAG, "Sighash verify failed (err=%d)", serr);
+            send_error(seq, HWP_ERR_INVALID_STATE, "sighash verify failed");
+            session_reset();
+            return;
+        }
+
+        ESP_LOGI(TAG, "ZIP-244 sighash verified — signing authorized");
+        size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+        usb_transport_send(tx_buf, len);
+        return;
+    }
+
+    /* --- Normal action data (output_index 0..N-1) --- */
+    serr = orchard_signer_feed_action(&signer_ctx, out.output_data, out.output_data_len);
+    if (serr != SIGNER_OK) {
+        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected action" : "invalid action data";
+        send_error(seq, (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME, msg);
         session_reset();
         return;
     }
 
-    if (out.total_outputs != session_outputs_total) {
-        send_error(seq, HWP_ERR_INVALID_STATE, "total_outputs mismatch");
-        session_reset();
-        return;
-    }
-
-    /* Hash this output's data incrementally */
-    blake2b_Update(&session_hash_ctx, out.output_data, out.output_data_len);
-    session_outputs_received++;
-
-    ESP_LOGI(TAG, "TX_OUTPUT %d/%d hashed (%d bytes)",
+    ESP_LOGI(TAG, "Action %d/%d hashed (%d bytes)",
              out.output_index + 1, out.total_outputs, out.output_data_len);
 
-    /* Send ACK */
     size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
     usb_transport_send(tx_buf, len);
 }
@@ -166,32 +206,28 @@ static void handle_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payloa
     ESP_LOGI(TAG, "SIGN_REQ: amount=%llu fee=%llu recipient='%s'",
              (unsigned long long)req.amount, (unsigned long long)req.fee, req.recipient);
 
-    /* If we received outputs, verify sighash matches our incremental hash */
-    if (session_state == SESSION_RECEIVING_OUTPUTS) {
-        if (session_outputs_received != session_outputs_total) {
-            send_error(seq, HWP_ERR_INVALID_STATE, "not all outputs received");
-            session_reset();
-            return;
-        }
-
-        uint8_t computed_hash[32];
-        blake2b_Final(&session_hash_ctx, computed_hash, 32);
-        session_reset();
-
-        if (memcmp(computed_hash, req.sighash, 32) != 0) {
-            memzero(computed_hash, sizeof(computed_hash));
-            send_error(seq, HWP_ERR_SIGHASH_MISMATCH, "sighash mismatch");
-            return;
-        }
-        memzero(computed_hash, sizeof(computed_hash));
-        ESP_LOGI(TAG, "Sighash verified against outputs");
+    /* Check ZIP-244 verification via libzcash signer context.
+     * orchard_signer_check() enforces the invariant: no signing without
+     * prior sighash verification. This is a library-level guarantee. */
+    OrchardSignerError chk = orchard_signer_check(&signer_ctx, req.sighash);
+    if (chk == SIGNER_ERR_NOT_VERIFIED) {
+        ESP_LOGE(TAG, "SIGN_REQ rejected: ZIP-244 sighash not verified (send TX_OUTPUT first)");
+        send_error(seq, HWP_ERR_INVALID_STATE, "sighash not verified");
+        return;
     }
+    if (chk == SIGNER_ERR_WRONG_SIGHASH) {
+        ESP_LOGE(TAG, "SIGN_REQ sighash does not match verified sighash");
+        send_error(seq, HWP_ERR_SIGHASH_MISMATCH, "SignReq sighash mismatch");
+        session_reset();
+        return;
+    }
+    ESP_LOGI(TAG, "ZIP-244 sighash verified — proceeding with signature");
 
     led_status_set(LED_STATE_BUSY_SIGN);
     ESP_LOGI(TAG, "Signing transaction...");
 
     uint8_t sig[64], rk[32];
-    WalletError err = wallet_sign(req.sighash, req.alpha, sig, rk);
+    WalletError err = wallet_sign_via_ctx(&signer_ctx, req.sighash, req.alpha, sig, rk);
     if (err != WALLET_OK) {
         ESP_LOGE(TAG, "Signing FAILED (err=%d)", err);
         send_error(seq, HWP_ERR_SIGN_FAILED, "signing failed");
@@ -210,9 +246,8 @@ static void handle_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payloa
 
 static void handle_abort(uint8_t seq)
 {
-    if (session_state != SESSION_IDLE) {
-        ESP_LOGW(TAG, "Session aborted (had %d/%d outputs)",
-                 session_outputs_received, session_outputs_total);
+    if (signer_ctx.state != SIGNER_IDLE) {
+        ESP_LOGW(TAG, "Session aborted");
         session_reset();
     } else {
         ESP_LOGD(TAG, "ABORT (no active session)");
@@ -236,20 +271,8 @@ static void hwp_task(void *arg)
     }
     ESP_LOGI(TAG, "HWP listener started");
 
-    bool handshake_sent = false;
-
     for (;;) {
-        /* When host connects, send handshake PING (once per connection) */
-        if (usb_transport_host_connected() && !handshake_sent) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            send_ping();
-            handshake_sent = true;
-        }
-        if (!usb_transport_host_connected()) {
-            handshake_sent = false;
-        }
-
-        HwpFeedResult res = usb_transport_recv_frame(&rx_parser, 500);
+        HwpFeedResult res = usb_transport_recv_frame(&rx_parser, 0);
         if (res == HWP_FEED_CRC_ERROR) {
             send_error(rx_parser.frame.seq, HWP_ERR_BAD_FRAME, "CRC mismatch");
             continue;
@@ -304,7 +327,9 @@ static void usb_monitor_task(void *arg)
                 }
                 ESP_LOGI(TAG, " ACM0: HWP protocol | ACM1: logs");
                 ESP_LOGI(TAG, "========================================");
-                /* Handshake PING is sent by hwp_task when it sees host_connected */
+                /* Send handshake PING — companion expects device to initiate */
+                vTaskDelay(pdMS_TO_TICKS(300));
+                send_ping();
             } else {
                 ESP_LOGW(TAG, "Host connected but device still initializing...");
             }
@@ -335,6 +360,9 @@ void app_main(void)
     ESP_LOGI(TAG, " Zcash Orchard Hardware Wallet");
     ESP_LOGI(TAG, " HWP v%d | Target: ESP32-S2", HWP_VERSION);
     ESP_LOGI(TAG, "========================================");
+
+    /* Init signing context */
+    orchard_signer_init(&signer_ctx);
 
     /* [1/5] LED — immediate visual feedback */
     ESP_LOGI(TAG, "[1/5] Initializing LED...");

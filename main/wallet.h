@@ -66,14 +66,19 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96]);
 WalletError wallet_get_address(char *ua_out, size_t ua_len);
 
 /**
- * Sign a transaction with the spending key.
+ * Sign via an OrchardSignerCtx (enforces ZIP-244 verification).
+ * The context must be in VERIFIED state with matching sighash.
+ *
+ * @param ctx       Signing context (must be VERIFIED)
  * @param sighash   32-byte sighash
  * @param alpha     32-byte alpha randomizer
  * @param sig_out   64-byte signature output
  * @param rk_out    32-byte randomized key output
  */
-WalletError wallet_sign(const uint8_t sighash[32], const uint8_t alpha[32],
-                        uint8_t sig_out[64], uint8_t rk_out[32]);
+#include "orchard_signer.h"
+WalletError wallet_sign_via_ctx(const OrchardSignerCtx *ctx,
+                                const uint8_t sighash[32], const uint8_t alpha[32],
+                                uint8_t sig_out[64], uint8_t rk_out[32]);
 
 /**
  * Export the mnemonic for user backup.

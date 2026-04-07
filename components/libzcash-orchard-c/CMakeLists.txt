@@ -16,6 +16,8 @@ set(SRCS
     "${LIB_ROOT}/src/rand.c"
     "${LIB_ROOT}/src/hash_stubs.c"
     "${LIB_ROOT}/src/hwp.c"
+    "${LIB_ROOT}/src/zip244.c"
+    "${LIB_ROOT}/src/orchard_signer.c"
     "${LIB_ROOT}/src/aes/aescrypt.c"
     "${LIB_ROOT}/src/aes/aeskey.c"
     "${LIB_ROOT}/src/aes/aes_modes.c"

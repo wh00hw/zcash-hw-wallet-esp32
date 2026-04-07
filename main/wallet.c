@@ -12,6 +12,7 @@
 #include "bip39.h"
 #include "orchard.h"
 #include "redpallas.h"
+#include "orchard_signer.h"
 #include "memzero.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -171,6 +172,18 @@ bool wallet_is_backed_up(void)
  * Derive 64-byte BIP39 seed from the NVS-stored mnemonic.
  * Caller must memzero seed after use.
  */
+/* Log first N bytes of a buffer as hex (for debug, avoids exposing full keys) */
+static void log_hex_prefix(const char *label, const uint8_t *buf, size_t prefix_len)
+{
+    char hex[64];
+    size_t n = (prefix_len > 16) ? 16 : prefix_len;
+    for (size_t i = 0; i < n; i++) {
+        sprintf(hex + i * 2, "%02x", buf[i]);
+    }
+    hex[n * 2] = '\0';
+    ESP_LOGI(TAG, "  %s: %s...", label, hex);
+}
+
 static WalletError derive_seed(uint8_t seed[64])
 {
     nvs_handle_t h;
@@ -190,9 +203,13 @@ static WalletError derive_seed(uint8_t seed[64])
         return WALLET_ERR_NOT_INITIALIZED;
     }
 
+    ESP_LOGI(TAG, "derive_seed: mnemonic length=%d, first word='%.6s...'", (int)len, mnemonic);
+
     /* BIP39: mnemonic → seed (PBKDF2, 2048 rounds) */
     mnemonic_to_seed(mnemonic, "", seed, NULL);
     memzero(mnemonic, sizeof(mnemonic));
+
+    log_hex_prefix("seed[0..8]", seed, 8);
     return WALLET_OK;
 }
 
@@ -205,6 +222,8 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96])
         if (nvs_get_blob(h, NVS_KEY_FVK, fvk_out, &len) == ESP_OK && len == 96) {
             nvs_close(h);
             ESP_LOGI(TAG, "FVK loaded from NVS cache");
+            log_hex_prefix("ak (cached)", fvk_out, 8);
+            log_hex_prefix("nk (cached)", fvk_out + 32, 8);
             return WALLET_OK;
         }
         nvs_close(h);
@@ -220,16 +239,20 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96])
     uint8_t sk[32];
     orchard_derive_account_sk(seed, ZCASH_COIN_TYPE, ZCASH_ACCOUNT, sk);
     memzero(seed, sizeof(seed));
+    log_hex_prefix("sk[0..8]", sk, 8);
 
     /* Derive ask, nk, rivk */
     uint8_t ask[32], nk[32], rivk[32];
     orchard_derive_keys(sk, ask, nk, rivk);
     memzero(sk, sizeof(sk));
+    log_hex_prefix("ask[0..8]", ask, 8);
+    log_hex_prefix("nk[0..8]", nk, 8);
 
     /* FVK = ak || nk || rivk */
     uint8_t ak[32];
     redpallas_derive_ak(ask, ak);
     memzero(ask, sizeof(ask));
+    log_hex_prefix("ak[0..8]", ak, 8);
 
     memcpy(fvk_out,      ak,   32);
     memcpy(fvk_out + 32, nk,   32);
@@ -291,9 +314,14 @@ WalletError wallet_get_address(char *ua_out, size_t ua_len)
     return WALLET_OK;
 }
 
-WalletError wallet_sign(const uint8_t sighash[32], const uint8_t alpha[32],
-                        uint8_t sig_out[64], uint8_t rk_out[32])
+WalletError wallet_sign_via_ctx(const OrchardSignerCtx *ctx,
+                                const uint8_t sighash[32], const uint8_t alpha[32],
+                                uint8_t sig_out[64], uint8_t rk_out[32])
 {
+    ESP_LOGI(TAG, "=== SIGN START ===");
+    log_hex_prefix("sighash", sighash, 16);
+    log_hex_prefix("alpha", alpha, 16);
+
     uint8_t seed[64];
     WalletError werr = derive_seed(seed);
     if (werr != WALLET_OK) return werr;
@@ -301,17 +329,30 @@ WalletError wallet_sign(const uint8_t sighash[32], const uint8_t alpha[32],
     uint8_t sk[32];
     orchard_derive_account_sk(seed, ZCASH_COIN_TYPE, ZCASH_ACCOUNT, sk);
     memzero(seed, sizeof(seed));
+    log_hex_prefix("sk[0..8]", sk, 8);
 
     uint8_t ask[32], nk_discard[32], rivk_discard[32];
     orchard_derive_keys(sk, ask, nk_discard, rivk_discard);
     memzero(sk, sizeof(sk));
     memzero(nk_discard, sizeof(nk_discard));
     memzero(rivk_discard, sizeof(rivk_discard));
+    log_hex_prefix("ask[0..8]", ask, 8);
 
-    int ret = redpallas_sign(ask, alpha, sighash, sig_out, rk_out);
+    /* Sign via libzcash context — enforces ZIP-244 verification invariant */
+    OrchardSignerError serr = orchard_signer_sign(ctx, sighash, ask, alpha, sig_out, rk_out);
     memzero(ask, sizeof(ask));
 
-    return (ret == 0) ? WALLET_OK : WALLET_ERR_SIGN_FAILED;
+    if (serr != SIGNER_OK) {
+        ESP_LOGE(TAG, "orchard_signer_sign failed (err=%d)", serr);
+        ESP_LOGI(TAG, "=== SIGN END (FAILED) ===");
+        return WALLET_ERR_SIGN_FAILED;
+    }
+
+    log_hex_prefix("rk", rk_out, 8);
+    log_hex_prefix("sig[0..8]", sig_out, 8);
+    ESP_LOGI(TAG, "=== SIGN END ===");
+
+    return WALLET_OK;
 }
 
 WalletError wallet_wipe(void)

@@ -12,7 +12,9 @@ The firmware:
 
 - Generates a BIP39 24-word mnemonic on first boot
 - Derives Zcash Orchard keys via ZIP-32 (Pallas curve, Sinsemilla hash)
+- Caches derived keys (FVK, UA) in NVS for instant subsequent boots
 - Signs shielded transactions with RedPallas spend authorization
+- **ZIP-244 on-device sighash verification** — refuses to sign unless the transaction sighash has been independently verified from the raw action data
 - Speaks HWP v2 over dual USB CDC (one port for protocol, one for debug logs)
 - Never exposes the spending key — only the full viewing key leaves the device
 
@@ -238,7 +240,8 @@ What this PoC **does** implement correctly:
 - Immediate zeroing of all cryptographic intermediates (`memzero()`)
 - Hardware RNG (`esp_random()`) for all randomness
 - Spending key never leaves the device
-- Incremental sighash verification (TX outputs hashed on-device)
+- **ZIP-244 on-device sighash verification** — the device independently computes the full v5 shielded sighash from transaction metadata and action data, and refuses to sign if it doesn't match the companion's value. This is enforced at the library level (`orchard_signer_sign()` in libzcash-orchard-c), not in the firmware
+- Pre-computed transparent and sapling digests from the companion (the device only has access to the Orchard bundle; the trust model is sound since falsified digests would produce an invalid on-chain signature)
 
 ## License
 
