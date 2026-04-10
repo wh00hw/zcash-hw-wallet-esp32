@@ -78,13 +78,26 @@ static void send_pong(uint8_t seq)
     ESP_LOGI(TAG, "PING/PONG seq=%d", seq);
 }
 
-static void handle_fvk_req(uint8_t seq)
+static void handle_fvk_req(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
 {
-    ESP_LOGI(TAG, "FVK_REQ received (seq=%d), deriving full viewing key...", seq);
+    /* Parse coin_type from payload (4 bytes LE), or use default for backward compat */
+    uint32_t coin_type = ZCASH_DEFAULT_COIN_TYPE;
+    if (payload_len >= HWP_FVK_REQ_SIZE) {
+        coin_type = (uint32_t)payload[0]
+                  | ((uint32_t)payload[1] << 8)
+                  | ((uint32_t)payload[2] << 16)
+                  | ((uint32_t)payload[3] << 24);
+    }
+
+    ESP_LOGI(TAG, "FVK_REQ received (seq=%d, coin_type=%u), deriving full viewing key...",
+             seq, (unsigned)coin_type);
     led_status_set(LED_STATE_BUSY_KEY);
 
+    /* Store coin_type in signer context for session consistency */
+    signer_ctx.coin_type = coin_type;
+
     uint8_t fvk[96];
-    WalletError err = wallet_get_fvk(fvk);
+    WalletError err = wallet_get_fvk(fvk, coin_type);
     if (err != WALLET_OK) {
         ESP_LOGE(TAG, "FVK derivation FAILED (err=%d)", err);
         send_error(seq, HWP_ERR_SIGN_FAILED, "key derivation failed");
@@ -93,7 +106,7 @@ static void handle_fvk_req(uint8_t seq)
     size_t len = hwp_encode(tx_buf, seq, HWP_MSG_FVK_RSP, fvk, 96);
     usb_transport_send(tx_buf, len);
     led_status_set(LED_STATE_SUCCESS);
-    ESP_LOGI(TAG, "FVK_RSP sent (96 bytes, seq=%d)", seq);
+    ESP_LOGI(TAG, "FVK_RSP sent (96 bytes, seq=%d, coin_type=%u)", seq, (unsigned)coin_type);
 }
 
 static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
@@ -110,6 +123,13 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
     if (out.output_index == HWP_TX_META_INDEX) {
         serr = orchard_signer_feed_meta(&signer_ctx, out.output_data,
                                          out.output_data_len, out.total_outputs);
+        if (serr == SIGNER_ERR_NETWORK_MISMATCH) {
+            ESP_LOGE(TAG, "Network mismatch: FvkReq coin_type=%u vs TxMeta coin_type=%u",
+                     (unsigned)signer_ctx.coin_type, (unsigned)signer_ctx.tx_meta.coin_type);
+            send_error(seq, HWP_ERR_NETWORK_MISMATCH, "coin_type mismatch between FvkReq and TxMeta");
+            session_reset();
+            return;
+        }
         if (serr != SIGNER_OK) {
             send_error(seq, HWP_ERR_BAD_FRAME, "invalid tx metadata");
             session_reset();
@@ -227,7 +247,8 @@ static void handle_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payloa
     ESP_LOGI(TAG, "Signing transaction...");
 
     uint8_t sig[64], rk[32];
-    WalletError err = wallet_sign_via_ctx(&signer_ctx, req.sighash, req.alpha, sig, rk);
+    uint32_t coin_type = signer_ctx.coin_type ? signer_ctx.coin_type : ZCASH_DEFAULT_COIN_TYPE;
+    WalletError err = wallet_sign_via_ctx(&signer_ctx, req.sighash, req.alpha, sig, rk, coin_type);
     if (err != WALLET_OK) {
         ESP_LOGE(TAG, "Signing FAILED (err=%d)", err);
         send_error(seq, HWP_ERR_SIGN_FAILED, "signing failed");
@@ -290,7 +311,7 @@ static void hwp_task(void *arg)
             ESP_LOGI(TAG, "PONG received (seq=%d) — handshake complete", f->seq);
             break;
         case HWP_MSG_FVK_REQ:
-            handle_fvk_req(f->seq);
+            handle_fvk_req(f->seq, f->payload, f->payload_len);
             break;
         case HWP_MSG_TX_OUTPUT:
             handle_tx_output(f->seq, f->payload, f->payload_len);
@@ -414,7 +435,7 @@ void app_main(void)
 
         ESP_LOGI(TAG, "  Pre-deriving FVK (warms up Pallas curve, may take seconds)...");
         uint8_t fvk[96];
-        werr = wallet_get_fvk(fvk);
+        werr = wallet_get_fvk(fvk, ZCASH_DEFAULT_COIN_TYPE);
         memzero(fvk, sizeof(fvk));
         if (werr != WALLET_OK) {
             fatal_halt("FVK pre-derivation failed");
@@ -425,7 +446,7 @@ void app_main(void)
     }
 
     /* Get UA (cached in NVS by wallet.c, instant on subsequent boots) */
-    if (wallet_get_address(cached_ua, sizeof(cached_ua)) == WALLET_OK) {
+    if (wallet_get_address(cached_ua, sizeof(cached_ua), ZCASH_DEFAULT_COIN_TYPE) == WALLET_OK) {
         ESP_LOGI(TAG, "UA: %s", cached_ua);
     } else {
         ESP_LOGW(TAG, "UA derivation failed");

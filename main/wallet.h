@@ -9,12 +9,17 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/** Zcash Testnet coin type (ZIP-32) */
-#define ZCASH_COIN_TYPE   1
 /** Default account index */
 #define ZCASH_ACCOUNT     0
-/** Testnet HRP for Unified Addresses */
-#define ZCASH_UA_HRP      "utest"
+
+/** Default coin type used when FvkReq has no payload (backward compat). */
+#define ZCASH_DEFAULT_COIN_TYPE  1
+
+/** Return the Unified Address HRP for a given coin_type. */
+static inline const char* wallet_hrp_for_coin_type(uint32_t coin_type)
+{
+    return (coin_type == 133) ? "u" : "utest";
+}
 
 /** Wallet status codes */
 typedef enum {
@@ -54,16 +59,18 @@ WalletError wallet_import(const char *mnemonic);
 
 /**
  * Derive the full viewing key (ak || nk || rivk, 96 bytes).
- * @param fvk_out  96-byte output buffer
+ * @param fvk_out    96-byte output buffer
+ * @param coin_type  ZIP-32 coin type (133 = mainnet, 1 = testnet)
  */
-WalletError wallet_get_fvk(uint8_t fvk_out[96]);
+WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type);
 
 /**
  * Derive a Unified Address string.
- * @param ua_out   Output buffer for bech32m-encoded address
- * @param ua_len   Size of ua_out
+ * @param ua_out     Output buffer for bech32m-encoded address
+ * @param ua_len     Size of ua_out
+ * @param coin_type  ZIP-32 coin type (133 = mainnet, 1 = testnet)
  */
-WalletError wallet_get_address(char *ua_out, size_t ua_len);
+WalletError wallet_get_address(char *ua_out, size_t ua_len, uint32_t coin_type);
 
 /**
  * Sign via an OrchardSignerCtx (enforces ZIP-244 verification).
@@ -74,11 +81,13 @@ WalletError wallet_get_address(char *ua_out, size_t ua_len);
  * @param alpha     32-byte alpha randomizer
  * @param sig_out   64-byte signature output
  * @param rk_out    32-byte randomized key output
+ * @param coin_type ZIP-32 coin type for key derivation
  */
 #include "orchard_signer.h"
 WalletError wallet_sign_via_ctx(const OrchardSignerCtx *ctx,
                                 const uint8_t sighash[32], const uint8_t alpha[32],
-                                uint8_t sig_out[64], uint8_t rk_out[32]);
+                                uint8_t sig_out[64], uint8_t rk_out[32],
+                                uint32_t coin_type);
 
 /**
  * Export the mnemonic for user backup.

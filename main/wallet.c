@@ -213,15 +213,19 @@ static WalletError derive_seed(uint8_t seed[64])
     return WALLET_OK;
 }
 
-WalletError wallet_get_fvk(uint8_t fvk_out[96])
+WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type)
 {
+    /* Build NVS cache key per coin_type */
+    char fvk_key[16];
+    snprintf(fvk_key, sizeof(fvk_key), "fvk_%u", (unsigned)coin_type);
+
     /* Try NVS cache first */
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         size_t len = 96;
-        if (nvs_get_blob(h, NVS_KEY_FVK, fvk_out, &len) == ESP_OK && len == 96) {
+        if (nvs_get_blob(h, fvk_key, fvk_out, &len) == ESP_OK && len == 96) {
             nvs_close(h);
-            ESP_LOGI(TAG, "FVK loaded from NVS cache");
+            ESP_LOGI(TAG, "FVK loaded from NVS cache (coin_type=%u)", (unsigned)coin_type);
             log_hex_prefix("ak (cached)", fvk_out, 8);
             log_hex_prefix("nk (cached)", fvk_out + 32, 8);
             return WALLET_OK;
@@ -230,14 +234,14 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96])
     }
 
     /* Derive from scratch */
-    ESP_LOGI(TAG, "Deriving FVK (first time, may take seconds)...");
+    ESP_LOGI(TAG, "Deriving FVK (coin_type=%u, may take seconds)...", (unsigned)coin_type);
     uint8_t seed[64];
     WalletError werr = derive_seed(seed);
     if (werr != WALLET_OK) return werr;
 
     /* Derive account spending key */
     uint8_t sk[32];
-    orchard_derive_account_sk(seed, ZCASH_COIN_TYPE, ZCASH_ACCOUNT, sk);
+    orchard_derive_account_sk(seed, coin_type, ZCASH_ACCOUNT, sk);
     memzero(seed, sizeof(seed));
     log_hex_prefix("sk[0..8]", sk, 8);
 
@@ -262,53 +266,58 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96])
     memzero(nk, sizeof(nk));
     memzero(rivk, sizeof(rivk));
 
-    /* Cache in NVS */
+    /* Cache in NVS keyed by coin_type */
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_blob(h, NVS_KEY_FVK, fvk_out, 96);
+        nvs_set_blob(h, fvk_key, fvk_out, 96);
         nvs_commit(h);
         nvs_close(h);
-        ESP_LOGI(TAG, "FVK cached in NVS");
+        ESP_LOGI(TAG, "FVK cached in NVS (key=%s)", fvk_key);
     }
 
     return WALLET_OK;
 }
 
-WalletError wallet_get_address(char *ua_out, size_t ua_len)
+WalletError wallet_get_address(char *ua_out, size_t ua_len, uint32_t coin_type)
 {
+    /* Build NVS cache key per coin_type */
+    char ua_key[16];
+    snprintf(ua_key, sizeof(ua_key), "ua_%u", (unsigned)coin_type);
+
     /* Try NVS cache first */
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         size_t len = ua_len;
-        if (nvs_get_str(h, NVS_KEY_UA, ua_out, &len) == ESP_OK && len > 1) {
+        if (nvs_get_str(h, ua_key, ua_out, &len) == ESP_OK && len > 1) {
             nvs_close(h);
-            ESP_LOGI(TAG, "UA loaded from NVS cache");
+            ESP_LOGI(TAG, "UA loaded from NVS cache (coin_type=%u)", (unsigned)coin_type);
             return WALLET_OK;
         }
         nvs_close(h);
     }
 
     /* Derive from scratch */
-    ESP_LOGI(TAG, "Deriving unified address (first time, may take seconds)...");
+    const char *hrp = wallet_hrp_for_coin_type(coin_type);
+    ESP_LOGI(TAG, "Deriving unified address (coin_type=%u, hrp=%s)...", (unsigned)coin_type, hrp);
     uint8_t seed[64];
     WalletError werr = derive_seed(seed);
     if (werr != WALLET_OK) return werr;
 
     uint8_t d[11], pk_d[32];
     int ret = orchard_derive_unified_address(
-        seed, ZCASH_COIN_TYPE, ZCASH_ACCOUNT,
-        ZCASH_UA_HRP, ua_out, ua_len, d, pk_d);
+        seed, coin_type, ZCASH_ACCOUNT,
+        hrp, ua_out, ua_len, d, pk_d);
     memzero(seed, sizeof(seed));
 
     if (ret <= 0) {
         return WALLET_ERR_SIGN_FAILED;
     }
 
-    /* Cache in NVS */
+    /* Cache in NVS keyed by coin_type */
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_str(h, NVS_KEY_UA, ua_out);
+        nvs_set_str(h, ua_key, ua_out);
         nvs_commit(h);
         nvs_close(h);
-        ESP_LOGI(TAG, "UA cached in NVS");
+        ESP_LOGI(TAG, "UA cached in NVS (key=%s)", ua_key);
     }
 
     return WALLET_OK;
@@ -316,9 +325,10 @@ WalletError wallet_get_address(char *ua_out, size_t ua_len)
 
 WalletError wallet_sign_via_ctx(const OrchardSignerCtx *ctx,
                                 const uint8_t sighash[32], const uint8_t alpha[32],
-                                uint8_t sig_out[64], uint8_t rk_out[32])
+                                uint8_t sig_out[64], uint8_t rk_out[32],
+                                uint32_t coin_type)
 {
-    ESP_LOGI(TAG, "=== SIGN START ===");
+    ESP_LOGI(TAG, "=== SIGN START (coin_type=%u) ===", (unsigned)coin_type);
     log_hex_prefix("sighash", sighash, 16);
     log_hex_prefix("alpha", alpha, 16);
 
@@ -327,7 +337,7 @@ WalletError wallet_sign_via_ctx(const OrchardSignerCtx *ctx,
     if (werr != WALLET_OK) return werr;
 
     uint8_t sk[32];
-    orchard_derive_account_sk(seed, ZCASH_COIN_TYPE, ZCASH_ACCOUNT, sk);
+    orchard_derive_account_sk(seed, coin_type, ZCASH_ACCOUNT, sk);
     memzero(seed, sizeof(seed));
     log_hex_prefix("sk[0..8]", sk, 8);
 
