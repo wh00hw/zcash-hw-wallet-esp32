@@ -22,6 +22,8 @@
 #include "blake2b.h"
 #include "zip244.h"
 #include "orchard_signer.h"
+#include "secp256k1.h"
+#include "bip32.h"
 #include "bip39.h"
 #include "memzero.h"
 #include "led_status.h"
@@ -265,6 +267,201 @@ static void handle_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payloa
     ESP_LOGI(TAG, "SIGN_RSP sent (sig[64] + rk[32], seq=%d)", seq);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Transparent digest verification handlers (v3)                     */
+/* ------------------------------------------------------------------ */
+
+static void handle_transparent_input(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(seq, HWP_ERR_BAD_FRAME, "transparent input too short");
+        return;
+    }
+
+    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *data   = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t data_len     = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    OrchardSignerError serr;
+
+    /* First transparent input triggers begin_transparent on the signer */
+    if (input_index == 0 && signer_ctx.state == SIGNER_RECEIVING_ACTIONS) {
+        /* We need total_outputs from a subsequent TxTransparentOutput, but
+         * we don't know it yet. Begin with inputs only; outputs count will
+         * be set when the first TxTransparentOutput arrives.
+         * For now, pass 0 for outputs — they'll be counted as they arrive. */
+        serr = orchard_signer_begin_transparent(&signer_ctx, total_inputs, 0);
+        if (serr != SIGNER_OK) {
+            send_error(seq, HWP_ERR_INVALID_STATE, "cannot begin transparent");
+            session_reset();
+            return;
+        }
+        ESP_LOGI(TAG, "Transparent verification started (%d inputs)", total_inputs);
+    }
+
+    /* Sentinel: index == total_inputs → verify digest */
+    if (input_index == total_inputs) {
+        if (data_len != 32) {
+            send_error(seq, HWP_ERR_BAD_FRAME, "transparent sentinel must be 32 bytes");
+            session_reset();
+            return;
+        }
+
+        serr = orchard_signer_verify_transparent(&signer_ctx, data);
+        if (serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
+            ESP_LOGE(TAG, "Transparent digest MISMATCH");
+            send_error(seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH, "transparent digest mismatch");
+            return;
+        }
+        if (serr != SIGNER_OK) {
+            ESP_LOGE(TAG, "Transparent verify failed (err=%d)", serr);
+            send_error(seq, HWP_ERR_INVALID_STATE, "transparent verify failed");
+            session_reset();
+            return;
+        }
+
+        ESP_LOGI(TAG, "Transparent digest verified — matches TxMeta");
+        size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+        usb_transport_send(tx_buf, len);
+        return;
+    }
+
+    /* Normal input data */
+    serr = orchard_signer_feed_transparent_input(&signer_ctx, data, data_len);
+    if (serr != SIGNER_OK) {
+        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent input" : "invalid transparent input";
+        send_error(seq, (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME, msg);
+        session_reset();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Transparent input %d/%d hashed (%d bytes)",
+             input_index + 1, total_inputs, data_len);
+
+    size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+    usb_transport_send(tx_buf, len);
+}
+
+static void handle_transparent_output(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(seq, HWP_ERR_BAD_FRAME, "transparent output too short");
+        return;
+    }
+
+    uint16_t output_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_outputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *data    = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t data_len      = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    /* Set the expected outputs count on first output message */
+    if (output_index == 0 && signer_ctx.transparent_outputs_expected == 0) {
+        signer_ctx.transparent_outputs_expected = total_outputs;
+        ESP_LOGI(TAG, "Expecting %d transparent outputs", total_outputs);
+    }
+
+    OrchardSignerError serr = orchard_signer_feed_transparent_output(&signer_ctx, data, data_len);
+    if (serr != SIGNER_OK) {
+        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent output" : "invalid transparent output";
+        send_error(seq, (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME, msg);
+        session_reset();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Transparent output %d/%d hashed (%d bytes)",
+             output_index + 1, total_outputs, data_len);
+
+    size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+    usb_transport_send(tx_buf, len);
+}
+
+static void handle_transparent_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(seq, HWP_ERR_BAD_FRAME, "transparent sign req too short");
+        return;
+    }
+
+    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *input_data = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t input_data_len   = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    ESP_LOGI(TAG, "TRANSPARENT_SIGN_REQ (input %d/%d)", input_index + 1, total_inputs);
+
+    /* Must have completed transparent verification */
+    if (!signer_ctx.transparent_verified) {
+        send_error(seq, HWP_ERR_INVALID_STATE, "transparent not verified");
+        return;
+    }
+
+    /* Must be in VERIFIED state (sighash verification also passed) */
+    if (signer_ctx.state != SIGNER_VERIFIED) {
+        send_error(seq, HWP_ERR_INVALID_STATE, "sighash not verified");
+        return;
+    }
+
+    /* Compute per-input transparent sighash on-device */
+    uint8_t per_input_sighash[32];
+    zip244_transparent_per_input_sighash(
+        &signer_ctx.transparent_state,
+        input_index,
+        input_data,
+        input_data_len,
+        0x01, /* SIGHASH_ALL */
+        per_input_sighash);
+
+    ESP_LOGI(TAG, "Per-input transparent sighash computed:");
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, per_input_sighash, 32, ESP_LOG_INFO);
+
+    /* Derive transparent spending key via BIP-32 */
+    uint32_t coin_type = signer_ctx.coin_type ? signer_ctx.coin_type : 1;
+    uint8_t t_sk[32], t_pubkey[33];
+
+    uint8_t seed[64];
+    WalletError werr = wallet_get_seed(seed);
+    if (werr != WALLET_OK) {
+        send_error(seq, HWP_ERR_SIGN_FAILED, "seed access failed");
+        return;
+    }
+
+    if (bip32_derive_transparent_sk(seed, coin_type, t_sk, t_pubkey) != 0) {
+        memzero(seed, sizeof(seed));
+        send_error(seq, HWP_ERR_SIGN_FAILED, "BIP-32 derivation failed");
+        return;
+    }
+    memzero(seed, sizeof(seed));
+
+    /* Sign with ECDSA */
+    uint8_t compact_sig[64];
+    if (secp256k1_ecdsa_sign_digest(t_sk, per_input_sighash, compact_sig) != 0) {
+        memzero(t_sk, sizeof(t_sk));
+        send_error(seq, HWP_ERR_SIGN_FAILED, "ECDSA signing failed");
+        return;
+    }
+    memzero(t_sk, sizeof(t_sk));
+
+    /* DER encode */
+    uint8_t der_sig[72];
+    size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
+
+    /* Build response: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33] */
+    uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
+    rsp[0] = (uint8_t)der_len;
+    memcpy(rsp + 1, der_sig, der_len);
+    rsp[1 + der_len] = 0x01; /* SIGHASH_ALL */
+    memcpy(rsp + 1 + der_len + 1, t_pubkey, 33);
+
+    size_t rsp_len = 1 + der_len + 1 + 33;
+    size_t frame_len = hwp_encode(tx_buf, seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
+    usb_transport_send(tx_buf, frame_len);
+
+    ESP_LOGI(TAG, "TRANSPARENT_SIGN_RSP sent (DER %zu bytes + pubkey)", der_len);
+    memzero(compact_sig, sizeof(compact_sig));
+    memzero(per_input_sighash, sizeof(per_input_sighash));
+}
+
 static void handle_abort(uint8_t seq)
 {
     if (signer_ctx.state != SIGNER_IDLE) {
@@ -321,6 +518,15 @@ static void hwp_task(void *arg)
             break;
         case HWP_MSG_ABORT:
             handle_abort(f->seq);
+            break;
+        case HWP_MSG_TX_TRANSPARENT_INPUT:
+            handle_transparent_input(f->seq, f->payload, f->payload_len);
+            break;
+        case HWP_MSG_TX_TRANSPARENT_OUTPUT:
+            handle_transparent_output(f->seq, f->payload, f->payload_len);
+            break;
+        case HWP_MSG_TRANSPARENT_SIGN_REQ:
+            handle_transparent_sign_req(f->seq, f->payload, f->payload_len);
             break;
         default:
             send_error(f->seq, HWP_ERR_UNKNOWN, "unsupported msg type");
