@@ -241,7 +241,7 @@ What this PoC **does** implement correctly:
 - Hardware RNG (`esp_random()`) for all randomness
 - Spending key never leaves the device
 - **ZIP-244 on-device sighash verification** — the device independently computes the full v5 shielded sighash from transaction metadata and action data, and refuses to sign if it doesn't match the companion's value. This is enforced at the library level (`orchard_signer_sign()` in libzcash-orchard-c), not in the firmware
-- Pre-computed transparent and sapling digests from the companion (the device only has access to the Orchard bundle; the trust model is sound since falsified digests would produce an invalid on-chain signature)
+- **Every component of the ZIP-244 sighash is device-derived** — `header_digest` and `orchard_digest` are recomputed from streamed action data; `transparent_sig_digest` is recomputed from streamed transparent inputs/outputs via `orchard_signer_verify_transparent` (or matches the empty-bundle constant for transactions without transparent components); `sapling_digest` is enforced equal to the ZIP-244 empty-bundle constant `BLAKE2b-256("ZTxIdSaplingHash", [])` on `TxMeta` receipt — non-empty values abort the session with `SIGNER_ERR_SAPLING_NOT_EMPTY` before any action is hashed. The wallet is Orchard-only by design (no Sapling keys, no Sapling notes, no Sapling-only recipients in scope), so this invariant is a structural fit, not a restriction. No part of the sighash is taken on faith from the companion.
 
 ## License
 
