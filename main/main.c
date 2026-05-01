@@ -132,6 +132,13 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
             session_reset();
             return;
         }
+        if (serr == SIGNER_ERR_SAPLING_NOT_EMPTY) {
+            ESP_LOGE(TAG, "Sapling components not allowed (Orchard-only wallet)");
+            send_error(seq, HWP_ERR_SAPLING_NOT_EMPTY,
+                       "sapling components not allowed (Orchard-only)");
+            session_reset();
+            return;
+        }
         if (serr != SIGNER_OK) {
             send_error(seq, HWP_ERR_BAD_FRAME, "invalid tx metadata");
             session_reset();

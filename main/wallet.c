@@ -213,6 +213,11 @@ static WalletError derive_seed(uint8_t seed[64])
     return WALLET_OK;
 }
 
+WalletError wallet_get_seed(uint8_t seed_out[64])
+{
+    return derive_seed(seed_out);
+}
+
 WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type)
 {
     /* Build NVS cache key per coin_type */

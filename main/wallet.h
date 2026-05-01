@@ -65,6 +65,17 @@ WalletError wallet_import(const char *mnemonic);
 WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type);
 
 /**
+ * Derive the 64-byte BIP-39 seed from the NVS-stored mnemonic.
+ *
+ * Required by the transparent ECDSA signing path, which needs the raw
+ * seed for BIP-32 derivation. Caller MUST memzero the seed buffer
+ * after use; the seed is the master secret.
+ *
+ * @param seed_out  64-byte output buffer
+ */
+WalletError wallet_get_seed(uint8_t seed_out[64]);
+
+/**
  * Derive a Unified Address string.
  * @param ua_out     Output buffer for bech32m-encoded address
  * @param ua_len     Size of ua_out
