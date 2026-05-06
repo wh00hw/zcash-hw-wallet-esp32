@@ -205,8 +205,32 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
         return;
     }
 
-    /* --- Normal action data (output_index 0..N-1) --- */
-    serr = orchard_signer_feed_action(&signer_ctx, out.output_data, out.output_data_len);
+    /* --- Normal action data (output_index 0..N-1) ---
+     *
+     * Require the v4 payload: action[820] || recipient[43] || value[8 LE] || rseed[32].
+     * Hashing the encrypted action bytes alone is not enough — a hostile companion
+     * could put a cmx that commits to (attacker_address, value) inside the action
+     * while telling the user's UI "send to <Mario>". We recompute cmx on-device
+     * from the (recipient, value, rseed) the companion claims and require it to
+     * match the cmx field of the action bytes. */
+    HwpActionV4 av4;
+    if (!hwp_parse_action_v4(out.output_data, out.output_data_len, &av4)) {
+        send_error(seq, HWP_ERR_BAD_FRAME,
+                   "action payload must be 903 bytes (820 action + 43 recipient + 8 value + 32 rseed)");
+        session_reset();
+        return;
+    }
+    serr = orchard_signer_feed_action_with_note(
+        &signer_ctx, av4.action, HWP_ACTION_DATA_SIZE,
+        av4.recipient, av4.value, av4.rseed);
+    if (serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
+        ESP_LOGE(TAG, "Action %d/%d: NoteCommitment mismatch — recipient substitution attempt",
+                 out.output_index + 1, out.total_outputs);
+        send_error(seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
+                   "action cmx does not commit to claimed recipient/value/rseed");
+        session_reset();
+        return;
+    }
     if (serr != SIGNER_OK) {
         const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected action" : "invalid action data";
         send_error(seq, (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME, msg);
@@ -214,7 +238,7 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
         return;
     }
 
-    ESP_LOGI(TAG, "Action %d/%d hashed (%d bytes)",
+    ESP_LOGI(TAG, "Action %d/%d hashed + cmx verified (%d bytes)",
              out.output_index + 1, out.total_outputs, out.output_data_len);
 
     size_t len = hwp_encode(tx_buf, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
