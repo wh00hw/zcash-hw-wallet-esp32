@@ -110,6 +110,13 @@ static void led_task(void *arg)
             break;
         }
 
+        case LED_STATE_AWAITING_CONFIRM: {
+            /* Magenta blinking — high-attention state, user input required */
+            bool on = (tick / BLINK_MS) % 2 == 0;
+            led_rgb(on ? 60 : 0, 0, on ? 50 : 0);
+            break;
+        }
+
         default:
             led_rgb(0, 0, 0);
             break;

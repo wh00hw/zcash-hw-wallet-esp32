@@ -27,6 +27,7 @@
 #include "bip39.h"
 #include "memzero.h"
 #include "led_status.h"
+#include "user_input.h"
 
 static const char *TAG = "hwp";
 
@@ -45,6 +46,95 @@ static OrchardSignerCtx signer_ctx;
 static void session_reset(void)
 {
     orchard_signer_reset(&signer_ctx);
+}
+
+/* Wait CDC1 long enough for any in-flight log lines to flush before we
+ * change state. Otherwise the user may see "approve?" before the recipient
+ * line has finished printing on the host's terminal. */
+static void log_drain_delay(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(80));
+}
+
+/**
+ * Display each Orchard output's recipient + value to the user (via the
+ * CDC1 debug log) and require an explicit BOOT-button confirmation per
+ * output before calling orchard_signer_confirm_action(). Without this
+ * loop, the libzcash signer state machine refuses to advance to
+ * VERIFIED (SIGNER_ERR_ACTION_NOT_CONFIRMED), and any subsequent SIGN_REQ
+ * is rejected with NOT_VERIFIED — by library invariant, not firmware
+ * convention.
+ *
+ * Returns true on full approval, false if the user long-presses (cancel)
+ * or the timeout fires for any output.
+ */
+static bool run_per_output_confirmation(void)
+{
+    const uint32_t coin_type =
+        signer_ctx.coin_type ? signer_ctx.coin_type : ZCASH_DEFAULT_COIN_TYPE;
+    const char *hrp = wallet_hrp_for_coin_type(coin_type);
+
+    led_status_set(LED_STATE_AWAITING_CONFIRM);
+    ESP_LOGW(TAG, "");
+    ESP_LOGW(TAG, "==================================================");
+    ESP_LOGW(TAG, "  REVIEW EACH OUTPUT BEFORE SIGNING");
+    ESP_LOGW(TAG, "  Short-press BOOT to confirm, hold >2s to cancel");
+    ESP_LOGW(TAG, "==================================================");
+
+    for (uint16_t i = 0; i < signer_ctx.actions_received; i++) {
+        uint8_t recipient[43];
+        uint64_t value;
+        OrchardSignerError gerr =
+            orchard_signer_get_action_display(&signer_ctx, i, recipient, &value);
+        if (gerr != SIGNER_OK) {
+            ESP_LOGE(TAG, "get_action_display(%u) failed (err=%d)", i, gerr);
+            return false;
+        }
+
+        char ua[256] = {0};
+        int n = orchard_encode_ua_raw(recipient, recipient + 11, hrp, ua, sizeof(ua));
+        if (n <= 0) {
+            ESP_LOGE(TAG, "orchard_encode_ua_raw failed for action %u", i);
+            return false;
+        }
+
+        /* Render value as "X.YYYYYYYY ZEC" — Zcash uses 8 decimals. */
+        const uint64_t COIN = 100000000ULL;
+        uint64_t whole = value / COIN;
+        uint64_t frac  = value % COIN;
+
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "  [Output %u/%u]", (unsigned)(i + 1),
+                 (unsigned)signer_ctx.actions_received);
+        ESP_LOGW(TAG, "    To:    %s", ua);
+        ESP_LOGW(TAG, "    Value: %llu.%08llu ZEC (%llu zatoshis)",
+                 (unsigned long long)whole,
+                 (unsigned long long)frac,
+                 (unsigned long long)value);
+        ESP_LOGW(TAG, "  → press BOOT to confirm, hold to cancel");
+        log_drain_delay();
+
+        UserInputResult r = user_input_wait(120000);  /* 2 minutes per output */
+        if (r == USER_INPUT_CONFIRM) {
+            OrchardSignerError cerr = orchard_signer_confirm_action(&signer_ctx, i);
+            if (cerr != SIGNER_OK) {
+                ESP_LOGE(TAG, "confirm_action(%u) failed (err=%d)", i, cerr);
+                return false;
+            }
+            ESP_LOGI(TAG, "    ✓ confirmed");
+        } else if (r == USER_INPUT_CANCEL) {
+            ESP_LOGW(TAG, "    ✗ cancelled by user");
+            return false;
+        } else {
+            ESP_LOGW(TAG, "    ✗ timeout — no confirmation received");
+            return false;
+        }
+    }
+
+    ESP_LOGW(TAG, "");
+    ESP_LOGW(TAG, "  ALL OUTPUTS CONFIRMED — proceeding to signing");
+    ESP_LOGW(TAG, "==================================================");
+    return true;
 }
 
 /* Embedded Sinsemilla S-table (1024 points, 64 bytes each = 64KB) */
@@ -139,6 +229,14 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
             session_reset();
             return;
         }
+        if (serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
+            ESP_LOGE(TAG, "Too many Orchard actions (%d > MAX=%d)",
+                     out.total_outputs, ORCHARD_SIGNER_MAX_ACTIONS);
+            send_error(seq, HWP_ERR_BAD_FRAME,
+                       "transaction has more Orchard actions than the device can display");
+            session_reset();
+            return;
+        }
         if (serr != SIGNER_OK) {
             send_error(seq, HWP_ERR_BAD_FRAME, "invalid tx metadata");
             session_reset();
@@ -159,6 +257,20 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
             session_reset();
             return;
         }
+
+        /* No-blind-signing: every output's recipient + value must be
+         * displayed to the user and explicitly approved before the signer
+         * state machine is allowed to advance. orchard_signer_verify()
+         * will return SIGNER_ERR_ACTION_NOT_CONFIRMED otherwise; we drive
+         * the UI loop here so by the time we call verify(), the lib's
+         * confirmation invariant is satisfied. */
+        if (!run_per_output_confirmation()) {
+            send_error(seq, HWP_ERR_USER_CANCELLED,
+                       "user cancelled or timed out during per-output review");
+            session_reset();
+            return;
+        }
+        led_status_set(LED_STATE_TX_PROGRESS);
 
         /* Log all intermediate digests for debug */
         {
@@ -622,10 +734,11 @@ void app_main(void)
     /* Init signing context */
     orchard_signer_init(&signer_ctx);
 
-    /* [1/5] LED — immediate visual feedback */
-    ESP_LOGI(TAG, "[1/5] Initializing LED...");
+    /* [1/5] LED + BOOT button — visual + tactile feedback */
+    ESP_LOGI(TAG, "[1/5] Initializing LED + user input...");
     led_status_init();
     led_status_set(LED_STATE_INITIALIZING);
+    user_input_init();
 
     /* [2/5] USB CDC (dual) — enables log output on ACM1 */
     ESP_LOGI(TAG, "[2/5] Initializing USB CDC transport (dual CDC)...");
