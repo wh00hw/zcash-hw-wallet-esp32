@@ -14,8 +14,11 @@ The firmware:
 - Derives Zcash Orchard keys via ZIP-32 (Pallas curve, Sinsemilla hash)
 - Caches derived keys (FVK, UA) in NVS for instant subsequent boots
 - Signs shielded transactions with RedPallas spend authorization
-- **ZIP-244 on-device sighash verification** — refuses to sign unless the transaction sighash has been independently verified from the raw action data
-- Speaks HWP v2 over dual USB CDC (one port for protocol, one for debug logs)
+- **ZIP-244 on-device sighash verification** — recomputes header / orchard / transparent digests on-device; enforces sapling_digest equal to the ZIP-244 empty-bundle constant
+- **NoteCommitment (cmx) verification** — recomputes Sinsemilla NoteCommit per Orchard action from the unencrypted note plaintext (recipient, value, rseed) and rejects recipient-substitution attempts before any data is shown to the user
+- **Per-output user confirmation** — for each Orchard output, displays the recipient (encoded as a Bech32m Unified Address) and value on the debug log, requires an explicit BOOT-button press, and blocks signing until the libzcash signer state machine has every action confirmed
+- **No-blind-signing invariant enforced by the C library** — the device cannot produce a signature unless sapling-empty + cmx-match + user-confirm + sighash-match all pass. Skipping any of them returns a typed error before RedPallas is invoked.
+- Speaks HWP v3 over dual USB CDC (one port for protocol, one for debug logs)
 - Never exposes the spending key — only the full viewing key leaves the device
 
 ## Architecture
@@ -179,8 +182,31 @@ The dev board's RGB LED indicates the current state:
 | Blue blinking | Initializing / deriving keys / signing |
 | Green solid | Ready / companion connected |
 | Cyan breathing | Receiving transaction outputs |
+| **Magenta blinking** | **Awaiting per-output user confirmation — press BOOT to approve, hold to cancel** |
 | Green flash | Operation succeeded |
 | Red flash | Error (transient) |
+
+### Per-Output User Confirmation
+
+After the device has streamed and verified every Orchard action's NoteCommitment but **before** the ZIP-244 sighash is finalized and signing is allowed, the firmware drives a per-output review loop. For each output:
+
+1. Encodes the recipient `(d, pk_d)` into a Bech32m Unified Address via `orchard_encode_ua_raw`
+2. Logs to the debug port (`/dev/ttyACM1`):
+   ```
+   [Output i/N]
+     To:    u1...
+     Value: 0.50000000 ZEC (50000000 zatoshis)
+   → press BOOT to confirm, hold to cancel
+   ```
+3. Sets the LED to magenta blinking (`LED_STATE_AWAITING_CONFIRM`)
+4. Waits up to 2 minutes for a **BOOT button** press (GPIO0):
+   - **Short press** → calls `orchard_signer_confirm_action(idx)`, advances to next output
+   - **Long press (≥ 2 s)** → cancel; signing is aborted with `HWP_ERR_USER_CANCELLED`
+   - **Timeout** → cancel as above
+
+After all outputs are confirmed, the libzcash signer state machine accepts `verify()`, transitions to `SIGNER_VERIFIED`, and a subsequent `SIGN_REQ` produces a signature. Without all confirmations, `orchard_signer_verify()` returns `SIGNER_ERR_ACTION_NOT_CONFIRMED` and `orchard_signer_sign()` returns `NOT_VERIFIED` — the firmware cannot bypass this; it is a C-library state-machine invariant.
+
+> **Note on UX limits.** GPIO0 is the BOOT button on the Flipper WiFi Dev Board v1 — a single momentary push-to-ground input is the only physical control the user has. This is sufficient to enforce the security invariant (refuse-without-confirm) but is a minimal UX. The full per-output UI (screen + 4 buttons + scrollable UA) lives on [FlipZcash](https://github.com/wh00hw/FlipZcash) — the ESP32 reference port is for protocol and library-level demonstrations.
 
 ### Test Scripts
 
@@ -218,9 +244,24 @@ Binary framed serial protocol over USB CDC at 115200 baud.
 | SIGN_REQ | `0x05` | Host → Device | `sighash[32] \|\| alpha[32] \|\| amount[8] \|\| fee[8] \|\| recipient_len[1] \|\| recipient[N]` |
 | SIGN_RSP | `0x06` | Device → Host | `sig[64] \|\| rk[32]` |
 | ERROR | `0x07` | Device → Host | `error_code[1] \|\| message[N]` |
-| TX_OUTPUT | `0x08` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` |
+| TX_OUTPUT | `0x08` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` (see TX_OUTPUT layout below) |
 | TX_OUTPUT_ACK | `0x09` | Device → Host | (empty) |
 | ABORT | `0x0A` | Host → Device | (empty) |
+
+**TX_OUTPUT data layout** depends on `index`:
+
+- `index = 0xFFFF` (TxMeta): 129 bytes — `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE] || anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
+- `index = 0..N-1` (Orchard action, v4): 903 bytes — `cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32]`. The trailing 83 bytes (note plaintext) let the device recompute `cmx` and verify it commits to the claimed recipient/value/rseed.
+- `index = N` (sentinel): 32 bytes — expected ZIP-244 sighash for device comparison.
+
+**Selected error codes** (over the standard set):
+
+| Code | Name | Meaning |
+|---|---|---|
+| `0x0B` | `TransparentDigestMismatch` | Device-recomputed transparent digest ≠ value in TxMeta |
+| `0x0C` | `SaplingNotEmpty` | `sapling_digest` ≠ ZIP-244 empty-bundle constant — Orchard-only invariant violation |
+| `0x0D` | `NoteCommitmentMismatch` | Device-recomputed cmx ≠ action.cmx — recipient-substitution attempt |
+| `0x06` | `UserCancelled` | User long-pressed BOOT during per-output review or timed out |
 
 ## Security Considerations
 
@@ -230,18 +271,21 @@ This is a **proof of concept**. In a real hardware wallet, you would need:
 - **NVS encryption** (ESP32-S2 lacks HMAC eFuse support, so this is not trivial)
 - **Anti-tampering** mechanisms (tamper-detect mesh, potting, fuses)
 - **Secure boot** with signed firmware images
-- **User confirmation** on-device (physical button press before signing)
 - **PIN/passphrase** protection
 - **Side-channel attack** mitigations beyond constant-time scalar math
 - **Supply chain verification**
+- **Production-grade UI** — a single BOOT button + serial log is enough to enforce the per-output confirmation invariant, but a real device would have a dedicated screen and dedicated approve/cancel buttons
 
 What this PoC **does** implement correctly:
-- Constant-time Montgomery ladder for scalar multiplication
-- Immediate zeroing of all cryptographic intermediates (`memzero()`)
-- Hardware RNG (`esp_random()`) for all randomness
-- Spending key never leaves the device
-- **ZIP-244 on-device sighash verification** — the device independently computes the full v5 shielded sighash from transaction metadata and action data, and refuses to sign if it doesn't match the companion's value. This is enforced at the library level (`orchard_signer_sign()` in libzcash-orchard-c), not in the firmware
-- **Every component of the ZIP-244 sighash is device-derived** — `header_digest` and `orchard_digest` are recomputed from streamed action data; `transparent_sig_digest` is recomputed from streamed transparent inputs/outputs via `orchard_signer_verify_transparent` (or matches the empty-bundle constant for transactions without transparent components); `sapling_digest` is enforced equal to the ZIP-244 empty-bundle constant `BLAKE2b-256("ZTxIdSaplingHash", [])` on `TxMeta` receipt — non-empty values abort the session with `SIGNER_ERR_SAPLING_NOT_EMPTY` before any action is hashed. The wallet is Orchard-only by design (no Sapling keys, no Sapling notes, no Sapling-only recipients in scope), so this invariant is a structural fit, not a restriction. No part of the sighash is taken on faith from the companion.
+
+- **Constant-time scalar multiplication** — Montgomery ladder, no branching on secret bits
+- **Immediate zeroing of all cryptographic intermediates** (`memzero()`)
+- **Hardware RNG** — `esp_random()` for all randomness
+- **Spending key never leaves the device** — only FVK and UA are exported
+- **ZIP-244 on-device sighash verification** — `header_digest` and `orchard_digest` recomputed from streamed action data; `transparent_sig_digest` recomputed from streamed transparent inputs/outputs via `orchard_signer_verify_transparent` (or empty-bundle constant when no transparent components); `sapling_digest` enforced equal to the ZIP-244 empty-bundle constant on `TxMeta` receipt (non-empty values abort with `SIGNER_ERR_SAPLING_NOT_EMPTY` before any action data is hashed). No part of the sighash is taken on faith from the companion.
+- **Per-action NoteCommitment recomputation** — for every Orchard action, the device recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` from the unencrypted note plaintext (`recipient`, `value`, `rseed`) the companion declares, and rejects mismatches with `SIGNER_ERR_NOTE_COMMITMENT_MISMATCH`. Closes the recipient-substitution attack a hostile companion would otherwise mount inside the Orchard bundle.
+- **Per-output user confirmation as a state-machine invariant** — `orchard_signer_verify()` refuses to advance to `SIGNER_VERIFIED` unless every action has been explicitly confirmed via `orchard_signer_confirm_action()`, and `orchard_signer_sign()` refuses with `NOT_VERIFIED` unless the state is `VERIFIED`. The firmware drives the confirmation loop (CDC log + BOOT-button press per output) but cannot bypass the lib's check; a build that skipped the UI would still be unable to extract a signature. This is the "no blind signing" guarantee, expressed as a C-library invariant.
+- **Orchard-only by design** — no Sapling keys derived, no Sapling notes ever held, no Sapling-only recipients accepted. The Sapling-component lockout is a structural fit of the wallet, not an arbitrary restriction.
 
 ## License
 
