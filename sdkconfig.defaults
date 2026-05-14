@@ -10,13 +10,45 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # NVS encryption disabled (ESP32-S2 lacks HMAC eFuse support)
 # CONFIG_NVS_ENCRYPTION is not set
 
+# Secret-prefix debug logs OFF by default. Enabling mirrors ~8 byte prefixes
+# of seed/sk/ask/nk to USB CDC1 — must stay off in any build that handles
+# real ZEC. See docs/security-audit/03-firmware-esp32.md C-5.
+# CONFIG_DEBUG_LOG_SECRETS is not set
+
 # Watchdog — long key derivations can take seconds
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 
 # Optimize for size (limited flash)
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
+# ===== Build hardening (audit docs/security-audit/03-firmware-esp32.md) =====
+# Stack canaries — catch buffer overruns in HWP frame / mnemonic / FVK paths
+# rather than letting them silently corrupt return addresses (audit H-6).
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
+CONFIG_COMPILER_STACK_CHECK=y
+
+# Heap poisoning — turn use-after-free / double-free / overflow into a
+# crash-on-detect rather than a silent exploitable corruption (audit M-3).
+CONFIG_HEAP_POISONING_LIGHT=y
+
+# GDB stub disabled — the panic handler must reset, not drop into a stub
+# that exposes arbitrary memory read/write over UART (audit H-3).
+# CONFIG_ESP_GDBSTUB_ENABLED is not set
+
+# Anti-rollback for OTA: bootloader refuses to boot a firmware whose
+# CONFIG_BOOTLOADER_APP_SECURE_VERSION is below the burned eFuse value.
+# Combined with Secure Boot v2 (see docs/security-audit/PROVISIONING.md),
+# this prevents an attacker from downgrading to a vulnerable build (audit H-2).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_SECURE_VERSION=1
+# ============================================================================
+
 # Disable unused features to save RAM/flash
+# WiFi/BT MUST remain disabled in the binary: WiFi alone pulls in mbedTLS,
+# WPA3 supplicant, SoftAP, and ~hundreds of KB of attack surface that has
+# no place in a hardware wallet. Run `idf.py reconfigure` after editing
+# this file and verify via `idf.py size-components` that libwifi.a is not
+# linked (audit H-4).
 CONFIG_ESP_WIFI_ENABLED=n
 CONFIG_BT_ENABLED=n
 

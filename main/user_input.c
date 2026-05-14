@@ -2,10 +2,12 @@
  * User-input implementation — see user_input.h
  */
 #include "user_input.h"
+#include "led_status.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "memzero.h"
 
 static const char *TAG = "input";
 
@@ -86,4 +88,97 @@ UserInputResult user_input_wait(uint32_t timeout_ms)
         }
     }
     return USER_INPUT_CONFIRM;
+}
+
+/* ====================================================================== */
+/*  PIN entry via tap-count encoding (audit H-5)                          */
+/* ====================================================================== */
+
+#define PIN_TAP_DEBOUNCE_MS    30
+#define PIN_DIGIT_PAUSE_MS   1500   /* idle time that confirms a digit */
+#define PIN_CANCEL_HOLD_MS   3000
+#define PIN_DIGIT_TIMEOUT_MS 60000  /* fresh-prompt timeout */
+#define PIN_TAPS_MAX            10  /* 10 taps = digit 0 */
+
+/* Wait for a button press OR a `pause_ms` idle window, whichever comes
+ * first. Returns:
+ *    1  press detected
+ *    0  pause elapsed without any press
+ *   -1  press detected AND was held >= cancel_hold_ms (cancel signal).
+ *       The function consumes the rest of the long press so the button
+ *       is in released state on return.
+ */
+static int wait_press_or_pause(uint32_t pause_ms, uint32_t cancel_hold_ms) {
+    uint32_t elapsed = 0;
+    while (!button_pressed()) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        elapsed += POLL_MS;
+        if (elapsed >= pause_ms) return 0;
+    }
+    /* Press edge — debounce. */
+    vTaskDelay(pdMS_TO_TICKS(PIN_TAP_DEBOUNCE_MS));
+    if (!button_pressed()) return 0; /* spurious */
+
+    /* Measure hold duration to distinguish tap from cancel. */
+    uint32_t held = PIN_TAP_DEBOUNCE_MS;
+    while (button_pressed()) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        held += POLL_MS;
+        if (held >= cancel_hold_ms) {
+            /* Consume the rest of the long press. */
+            while (button_pressed()) {
+                vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            }
+            return -1;
+        }
+    }
+    return 1;  /* short tap */
+}
+
+PinEntryResult user_input_collect_pin(uint8_t pin_out[WALLET_PIN_LEN]) {
+    if (!s_initialized) {
+        if (user_input_init() != 0) return PIN_ENTRY_TIMEOUT;
+    }
+    memzero(pin_out, WALLET_PIN_LEN);
+
+    for (int d = 0; d < WALLET_PIN_LEN; d++) {
+        led_status_set(LED_STATE_AWAITING_CONFIRM);
+
+        int taps = 0;
+        for (;;) {
+            uint32_t pause = (taps == 0) ? PIN_DIGIT_TIMEOUT_MS : PIN_DIGIT_PAUSE_MS;
+            int rc = wait_press_or_pause(pause, PIN_CANCEL_HOLD_MS);
+            if (rc == -1) {
+                memzero(pin_out, WALLET_PIN_LEN);
+                return PIN_ENTRY_CANCELLED;
+            }
+            if (rc == 0) {
+                if (taps == 0) {
+                    memzero(pin_out, WALLET_PIN_LEN);
+                    return PIN_ENTRY_TIMEOUT;
+                }
+                /* Pause elapsed with at least one tap → digit confirmed. */
+                break;
+            }
+            /* rc == 1: short tap. */
+            if (taps < PIN_TAPS_MAX) taps++;
+        }
+
+        /* Map tap count to digit: 1..9 taps => digit equal to count;
+         * 10 taps => digit 0 (i.e. count modulo 10). */
+        pin_out[d] = (uint8_t)(taps % 10);
+
+        /* Visual echo: blink the entered count via the BUSY pulse so the
+         * user can verify they entered the digit they intended. The
+         * firmware can map LED_STATE_BUSY_KEY to a specific colour. */
+        led_status_set(LED_STATE_BUSY_KEY);
+        for (int b = 0; b < taps; b++) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            led_status_set(LED_STATE_READY);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            led_status_set(LED_STATE_BUSY_KEY);
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    return PIN_ENTRY_OK;
 }

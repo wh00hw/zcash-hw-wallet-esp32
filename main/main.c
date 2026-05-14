@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "bootloader_random.h"
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
 #include "freertos/ringbuf.h"
@@ -19,13 +20,14 @@
 #include "wallet.h"
 #include "orchard.h"
 #include "redpallas.h"
-#include "blake2b.h"
 #include "zip244.h"
 #include "orchard_signer.h"
 #include "secp256k1.h"
 #include "bip32.h"
 #include "bip39.h"
 #include "memzero.h"
+#include "aes_ct.h"
+#include "mbedtls/aes.h"
 #include "led_status.h"
 #include "user_input.h"
 
@@ -141,11 +143,51 @@ static bool run_per_output_confirmation(void)
 extern const uint8_t sinsemilla_s_bin_start[] asm("_binary_sinsemilla_s_bin_start");
 extern const uint8_t sinsemilla_s_bin_end[]   asm("_binary_sinsemilla_s_bin_end");
 
+/* The Sinsemilla S-table integrity check is performed by the library
+ * function `pallas_verify_sinsemilla_table()` (see audit M-5). It walks
+ * the registered lookup callback for every index and compares the
+ * BLAKE2b-256 of the returned data against the canonical fingerprint
+ * baked into the library. Keeping the check in the library means every
+ * firmware (regardless of how the table is embedded — objcopy on
+ * ESP-IDF, BOLOS resource on Ledger, raw flash region on STM32 — gets
+ * the same canonical defence). This file just registers the callback. */
+
 static bool sinsemilla_lookup(uint32_t index, uint8_t buf_out[64], void *ctx)
 {
     if (index >= 1024) return false;
     memcpy(buf_out, sinsemilla_s_bin_start + index * 64, 64);
     return true;
+}
+
+/* ============================================================================
+ * Hardware-AES backend for libzcash-orchard-c (audit H-3).
+ *
+ * The C library ships with a constant-time software AES-256 (aes_ct.c) used
+ * by FF1 for diversifier derivation. ESP32-S2 has a hardware AES peripheral
+ * which is constant-time by construction and significantly faster than the
+ * software fallback. We register an override that routes every AES-256 ECB
+ * call through ESP-IDF's mbedtls — which on this target dispatches to the
+ * hardware accelerator when CONFIG_MBEDTLS_HARDWARE_AES is enabled (it is
+ * by default in ESP-IDF).
+ *
+ * The override signature takes the master key directly (32 bytes), so each
+ * call re-schedules. mbedTLS's HW path makes this essentially free; the
+ * software path would re-schedule too.
+ * ============================================================================ */
+static void hw_aes256_override(void *ctx_user,
+                               const uint8_t key[32],
+                               const uint8_t in[16],
+                               uint8_t out[16])
+{
+    (void)ctx_user;
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    /* setkey_enc returns non-zero only on invalid key sizes — 256 is always
+     * valid; we ignore the return rather than introduce an error path that
+     * the C library's interface does not have. */
+    (void)mbedtls_aes_setkey_enc(&aes, key, 256);
+    (void)mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, in, out);
+    mbedtls_aes_free(&aes);
 }
 
 /* Yield callback — feeds watchdog during long Sinsemilla computations */
@@ -368,8 +410,66 @@ static void handle_sign_req(uint8_t seq, const uint8_t *payload, uint16_t payloa
         return;
     }
 
-    ESP_LOGI(TAG, "SIGN_REQ: amount=%llu fee=%llu recipient='%s'",
-             (unsigned long long)req.amount, (unsigned long long)req.fee, req.recipient);
+    /* req.recipient binding to the actions actually being signed.
+     *
+     * Two complementary defences guarantee the signed transaction matches
+     * what the user intended:
+     *   1. cmx recomputation in orchard_signer_feed_action_with_note() —
+     *      a hostile companion that swapped the on-chain recipient cannot
+     *      produce a colliding cmx;
+     *   2. per-action user confirmation in run_per_output_confirmation() —
+     *      every output's UA-encoded recipient and value is shown on the
+     *      device and the user must press BOOT for each one.
+     *
+     * The validation here is a third belt-and-braces check that catches
+     * companions that LIE TO THE HOST UI: a malicious companion app could
+     * tell the user via its own dialog "send 1 ZEC to <Mario>" while the
+     * device's screen shows the (true, attacker-controlled) recipient. A
+     * user accustomed to "host UI = device UI" might not notice. The
+     * device decodes req.recipient as a UA, finds its Orchard receiver,
+     * and verifies that receiver appears among the actions' recipients
+     * (which the user has explicitly approved per-output). On mismatch,
+     * we refuse to sign and reset the session.
+     * Tracked in docs/security-audit/02-orchard-protocol-signing.md C1.
+     *
+     * Empty recipient is ignored — companions that opt out of providing a
+     * hint cannot trigger this check, and the per-output confirmation
+     * remains the authoritative path. */
+    if (req.recipient[0] != '\0') {
+        uint32_t coin_type =
+            signer_ctx.coin_type ? signer_ctx.coin_type : ZCASH_DEFAULT_COIN_TYPE;
+        const char *expected_hrp = wallet_hrp_for_coin_type(coin_type);
+
+        uint8_t orchard_recipient[43];
+        int dec = orchard_decode_ua_orchard_receiver(
+            req.recipient, expected_hrp, orchard_recipient);
+
+        if (dec != 0) {
+            ESP_LOGE(TAG, "SIGN_REQ recipient decode failed (err=%d, hrp='%s', ua='%s')",
+                     dec, expected_hrp, req.recipient);
+            send_error(seq, HWP_ERR_BAD_FRAME,
+                       "SIGN_REQ recipient cannot be decoded as a UA on this network");
+            session_reset();
+            return;
+        }
+
+        bool match = orchard_signer_recipient_matches_any(&signer_ctx, orchard_recipient);
+        memzero(orchard_recipient, sizeof(orchard_recipient));
+
+        if (!match) {
+            ESP_LOGE(TAG, "SIGN_REQ recipient MISMATCH: companion claims '%s' but "
+                          "no signed action has that Orchard receiver — refusing to sign",
+                     req.recipient);
+            send_error(seq, HWP_ERR_SIGHASH_MISMATCH,
+                       "SIGN_REQ.recipient does not match any signed action");
+            session_reset();
+            return;
+        }
+
+        ESP_LOGI(TAG, "SIGN_REQ recipient matched to a confirmed action (amount=%llu fee=%llu)",
+                 (unsigned long long)req.amount,
+                 (unsigned long long)req.fee);
+    }
 
     /* Check ZIP-244 verification via libzcash signer context.
      * orchard_signer_check() enforces the invariant: no signing without
@@ -616,6 +716,65 @@ static void handle_abort(uint8_t seq)
     led_status_set(LED_STATE_CONNECTED);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Device attestation handlers (audit M1)                            */
+/* ------------------------------------------------------------------ */
+
+static void handle_identity_req(uint8_t seq)
+{
+    ESP_LOGI(TAG, "IDENTITY_REQ received (seq=%d)", seq);
+
+    uint8_t device_pk[HWP_DEVICE_PUBKEY_SIZE];
+    WalletError werr = wallet_get_or_create_device_identity(device_pk);
+    if (werr != WALLET_OK) {
+        ESP_LOGE(TAG, "device identity load/create failed (err=%d)", werr);
+        send_error(seq, HWP_ERR_SIGN_FAILED, "device identity unavailable");
+        return;
+    }
+
+    size_t len = hwp_encode(tx_buf, seq, HWP_MSG_IDENTITY_RSP,
+                            device_pk, HWP_DEVICE_PUBKEY_SIZE);
+    usb_transport_send(tx_buf, len);
+    /* device_pk is public — no memzero needed. */
+    ESP_LOGI(TAG, "IDENTITY_RSP sent (32 bytes, seq=%d)", seq);
+}
+
+static void handle_attest_req(uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len != HWP_ATTEST_CHALLENGE_SIZE) {
+        ESP_LOGE(TAG, "ATTEST_REQ bad payload length (%d != %d)",
+                 payload_len, HWP_ATTEST_CHALLENGE_SIZE);
+        send_error(seq, HWP_ERR_BAD_FRAME, "attest challenge must be 32 bytes");
+        return;
+    }
+    ESP_LOGI(TAG, "ATTEST_REQ received (seq=%d)", seq);
+
+    uint8_t sig[HWP_ATTEST_SIG_SIZE];
+    uint8_t rk[HWP_DEVICE_PUBKEY_SIZE];
+    WalletError werr = wallet_attest(payload, sig, rk);
+    if (werr != WALLET_OK) {
+        ESP_LOGE(TAG, "attestation failed (err=%d)", werr);
+        send_error(seq, HWP_ERR_SIGN_FAILED, "attestation failed");
+        memzero(sig, sizeof(sig));
+        memzero(rk, sizeof(rk));
+        return;
+    }
+
+    /* Response = sig[64] || rk[32] (rk == device_pk because alpha was 0) */
+    uint8_t rsp[HWP_ATTEST_RSP_SIZE];
+    memcpy(rsp,                     sig, HWP_ATTEST_SIG_SIZE);
+    memcpy(rsp + HWP_ATTEST_SIG_SIZE, rk,  HWP_DEVICE_PUBKEY_SIZE);
+
+    size_t len = hwp_encode(tx_buf, seq, HWP_MSG_ATTEST_RSP, rsp, sizeof(rsp));
+    usb_transport_send(tx_buf, len);
+
+    memzero(sig, sizeof(sig));
+    memzero(rk, sizeof(rk));
+    memzero(rsp, sizeof(rsp));
+    ESP_LOGI(TAG, "ATTEST_RSP sent (sig+rk = %d bytes, seq=%d)",
+             HWP_ATTEST_RSP_SIZE, seq);
+}
+
 static void send_ping(void)
 {
     uint8_t seq = 0x01;
@@ -670,6 +829,12 @@ static void hwp_task(void *arg)
             break;
         case HWP_MSG_TRANSPARENT_SIGN_REQ:
             handle_transparent_sign_req(f->seq, f->payload, f->payload_len);
+            break;
+        case HWP_MSG_IDENTITY_REQ:
+            handle_identity_req(f->seq);
+            break;
+        case HWP_MSG_ATTEST_REQ:
+            handle_attest_req(f->seq, f->payload, f->payload_len);
             break;
         default:
             send_error(f->seq, HWP_ERR_UNKNOWN, "unsupported msg type");
@@ -731,6 +896,18 @@ void app_main(void)
     ESP_LOGI(TAG, " HWP v%d | Target: ESP32-S2", HWP_VERSION);
     ESP_LOGI(TAG, "========================================");
 
+    /* On ESP32-S2, esp_random() / esp_fill_random() return cryptographically
+     * strong entropy only when WiFi/BT is started or the SAR/RC oscillator
+     * chaos-mode source has been explicitly enabled. WiFi/BT are intentionally
+     * disabled on this device, so we enable the bootloader RNG source here and
+     * leave it on for the lifetime of the firmware: mnemonic generation at
+     * first boot, FVK derivation, and per-signature RedPallas nonce hedging
+     * all rely on a CSPRNG. No other code path on this board uses the SAR-ADC,
+     * which is the precondition Espressif documents for keeping the source
+     * enabled at runtime. (Audit: docs/security-audit/03-firmware-esp32.md C-4)
+     */
+    bootloader_random_enable();
+
     /* Init signing context */
     orchard_signer_init(&signer_ctx);
 
@@ -758,12 +935,44 @@ void app_main(void)
         fatal_halt("NVS init failed");
     }
 
-    /* [4/5] Crypto callbacks */
+    /* [4/5] Crypto callbacks + integrity self-tests */
     ESP_LOGI(TAG, "[4/5] Registering Pallas/Sinsemilla crypto callbacks...");
+
+    /* Register both callbacks BEFORE the integrity check, because
+     * pallas_verify_sinsemilla_table walks the lookup callback and uses
+     * pallas_yield to feed the watchdog during the 1024 iterations. */
     pallas_set_yield_cb(yield_cb, NULL);
     pallas_set_sinsemilla_lookup(sinsemilla_lookup, NULL);
-    ESP_LOGI(TAG, "  Sinsemilla S-table: %u bytes",
+
+    /* Verify the loaded S-table against the library's canonical
+     * BLAKE2b-256 fingerprint. A mismatch means the table on flash has
+     * been altered (supply-chain or fault attack) and we cannot trust
+     * any subsequent Sinsemilla output. Halt the device — refusing to
+     * operate is safer than producing signatures against a tampered
+     * note-commitment scheme. (audit M-5) */
+    if (!pallas_verify_sinsemilla_table()) {
+        fatal_halt("Sinsemilla S-table integrity check failed");
+    }
+    ESP_LOGI(TAG, "  Sinsemilla S-table: integrity verified (%u bytes)",
              (unsigned)(sinsemilla_s_bin_end - sinsemilla_s_bin_start));
+
+    /* Verify the constant-time software AES-256 against the FIPS-197 §C.3
+     * known-answer vector. This validates the SOFTWARE fallback used if
+     * the HW override is ever bypassed (e.g. mbedtls misconfiguration);
+     * a self-test failure here means a build broken in a way that would
+     * silently produce wrong diversifiers, so we halt rather than
+     * proceed. (audit H-3) */
+    if (!aes_ct_256_self_test()) {
+        fatal_halt("AES-256 constant-time self-test failed");
+    }
+    ESP_LOGI(TAG, "  AES-256 CT self-test: PASS");
+
+    /* Register the hardware-AES backend. After this call, every FF1 inner
+     * AES op dispatches through the ESP32-S2 AES peripheral (via mbedTLS)
+     * instead of the software fallback. The backend is constant-time by
+     * construction and ~10× faster than the software scan. */
+    aes_ct_256_set_override(hw_aes256_override, NULL);
+    ESP_LOGI(TAG, "  AES-256 backend: HW (mbedTLS via ESP32-S2 AES peripheral)");
 
     /* [5/5] Wallet — create or verify, derive keys */
     ESP_LOGI(TAG, "[5/5] Checking wallet state...");
@@ -780,8 +989,56 @@ void app_main(void)
         ESP_LOGW(TAG, " BACKUP YOUR MNEMONIC NOW!");
         ESP_LOGW(TAG, " %s", mnemonic);
         ESP_LOGW(TAG, "========================================");
+
+        /* H-5: collect a 5-digit PIN via tap-count, then seal the
+         * mnemonic under a PIN-derived key. Until the user completes
+         * this step, the wallet is NOT initialized in NVS. The mnemonic
+         * exists ONLY in this stack-local buffer (cleared on every
+         * exit path below). */
+        ESP_LOGW(TAG, "Now enter a 5-digit PIN via the BOOT button:");
+        ESP_LOGW(TAG, "  - tap the button N times for digit N (10 taps = 0)");
+        ESP_LOGW(TAG, "  - wait ~1.5s without tapping to confirm each digit");
+        ESP_LOGW(TAG, "  - hold >3s to cancel");
+        uint8_t pin[WALLET_PIN_LEN];
+        PinEntryResult pin_rc = user_input_collect_pin(pin);
+        if (pin_rc != PIN_ENTRY_OK) {
+            memzero(mnemonic, sizeof(mnemonic));
+            memzero(pin, sizeof(pin));
+            fatal_halt("PIN entry cancelled or timed out at provisioning");
+        }
+        werr = wallet_pin_provision(mnemonic, pin, "" /* no passphrase v1 */);
+        memzero(pin, sizeof(pin));
         memzero(mnemonic, sizeof(mnemonic));
-        ESP_LOGI(TAG, "  Mnemonic generated and stored in NVS");
+        if (werr != WALLET_OK) {
+            fatal_halt("wallet_pin_provision() failed");
+        }
+        ESP_LOGI(TAG, "  PIN provisioned, mnemonic sealed in NVS");
+
+        /* Display the device identity pubkey fingerprint at first boot.
+         * This is the trust window in which a user — or the standalone
+         * pairing CLI — captures the canonical pubkey for future
+         * attestation. After this boot, the same pubkey is returned
+         * via HWP IDENTITY_REQ but a hostile companion could lie about
+         * the displayed value; the fingerprint shown here on the trusted
+         * first-boot host is the authoritative reference. */
+        {
+            uint8_t device_pk[32];
+            if (wallet_get_or_create_device_identity(device_pk) == WALLET_OK) {
+                char hex[65];
+                for (int i = 0; i < 32; i++) {
+                    static const char H[] = "0123456789abcdef";
+                    hex[2*i]   = H[(device_pk[i] >> 4) & 0xF];
+                    hex[2*i+1] = H[device_pk[i] & 0xF];
+                }
+                hex[64] = 0;
+                ESP_LOGW(TAG, "========================================");
+                ESP_LOGW(TAG, " DEVICE IDENTITY PUBKEY (record this!):");
+                ESP_LOGW(TAG, " %s", hex);
+                ESP_LOGW(TAG, " Pin this in your pairing tool. Future");
+                ESP_LOGW(TAG, " attestations must return the same value.");
+                ESP_LOGW(TAG, "========================================");
+            }
+        }
 
         ESP_LOGI(TAG, "  Pre-deriving FVK (warms up Pallas curve, may take seconds)...");
         uint8_t fvk[96];
@@ -792,7 +1049,39 @@ void app_main(void)
         }
         ESP_LOGI(TAG, "  FVK pre-derivation complete — crypto ready");
     } else {
-        ESP_LOGI(TAG, "  Wallet found in NVS — skipping creation");
+        ESP_LOGI(TAG, "  Wallet found in NVS — PIN unlock required");
+
+        /* H-5: every subsequent boot prompts for PIN. The user has up to
+         * WALLET_PIN_LOCKOUT_MAX consecutive wrong-PIN attempts before
+         * the device wipes itself. Each wrong attempt re-prompts. */
+        for (;;) {
+            WalletPinStatus st = wallet_pin_status();
+            if (st == WALLET_PIN_LOCKED_OUT) {
+                ESP_LOGE(TAG, "Lockout threshold reached — wiping wallet!");
+                wallet_wipe();
+                fatal_halt("Lockout: wallet wiped, halt for re-provisioning");
+            }
+            ESP_LOGW(TAG, "Enter your 5-digit PIN via BOOT button:");
+            uint8_t pin[WALLET_PIN_LEN];
+            PinEntryResult pin_rc = user_input_collect_pin(pin);
+            if (pin_rc != PIN_ENTRY_OK) {
+                memzero(pin, sizeof(pin));
+                ESP_LOGW(TAG, "PIN entry cancelled — try again");
+                continue;
+            }
+            WalletError werr = wallet_pin_unlock(pin);
+            memzero(pin, sizeof(pin));
+            if (werr == WALLET_OK) {
+                ESP_LOGI(TAG, "  Wallet unlocked");
+                break;
+            }
+            if (werr == WALLET_ERR_LOCKED_OUT) {
+                ESP_LOGE(TAG, "Lockout threshold reached — wiping wallet!");
+                wallet_wipe();
+                fatal_halt("Lockout: wallet wiped, halt for re-provisioning");
+            }
+            /* WALLET_ERR_PIN_WRONG: loop and try again. */
+        }
     }
 
     /* Get UA (cached in NVS by wallet.c, instant on subsequent boots) */

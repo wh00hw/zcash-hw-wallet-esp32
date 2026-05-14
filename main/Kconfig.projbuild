@@ -1,0 +1,20 @@
+menu "Zcash HW Wallet"
+
+config DEBUG_LOG_SECRETS
+    bool "Log prefixes of secret-bearing material (DEV ONLY)"
+    default n
+    help
+        When enabled, debug-log prefixes (~8 bytes) of secret-bearing buffers
+        such as the BIP-39 seed, sk, ask, nk, and the first BIP-39 word.
+
+        These logs are mirrored to USB CDC ACM1, which is reachable by any
+        host that opens /dev/ttyACM1. With repeated signing operations the
+        prefixes leak enough material to dramatically narrow brute-force
+        search of the spending key.
+
+        MUST be 'n' for any build that handles real ZEC. Only enable when
+        actively diagnosing a derivation/signing issue on a throwaway seed.
+
+        Tracked in docs/security-audit/03-firmware-esp32.md C-5, L-8.
+
+endmenu

@@ -7,5 +7,5 @@ idf_component_register(
         "user_input.c"
     INCLUDE_DIRS "."
     REQUIRES nvs_flash esp_ringbuf
-    PRIV_REQUIRES libzcash-orchard-c esp_tinyusb esp_driver_ledc esp_driver_gpio
+    PRIV_REQUIRES libzcash-orchard-c esp_tinyusb esp_driver_ledc esp_driver_gpio bootloader_support mbedtls esp_timer
 )
