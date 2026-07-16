@@ -1,6 +1,6 @@
 set(LIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/lib")
 
-# IMPORTANT: lib/ is a git submodule of wh00hw/libzcash-orchard-c. After
+# IMPORTANT: lib/ is a git submodule of wh00hw/libzcash-ironwood-c. After
 # updating that repo, run `git submodule update --remote` here and commit
 # the new pointer, otherwise the file list below will reference content
 # the working tree does not contain. The library API expects the constant-
@@ -34,6 +34,7 @@ set(SRCS
     "${LIB_ROOT}/src/secp256k1.c"
     "${LIB_ROOT}/src/aes/aes_ct.c"
     "${LIB_ROOT}/src/aead.c"
+    "${LIB_ROOT}/src/chacha20poly1305.c"
     "${LIB_ROOT}/src/wallet_lockout.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/platform_rng.c"
 )
