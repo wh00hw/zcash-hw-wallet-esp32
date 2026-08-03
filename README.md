@@ -45,7 +45,7 @@ The firmware:
 | Component | Description |
 |---|---|
 | [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/) | Espressif IoT Development Framework (tested with v5.3) |
-| [libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c) | Pure-C Zcash Orchard crypto (included as git submodule under `components/libzcash-orchard-c/lib`) |
+| [libzcash-orchard-c](https://github.com/wh00hw/libzcash-ironwood-c) | Pure-C Zcash Orchard crypto (included as git submodule under `components/libzcash-orchard-c/lib`) |
 | [zcash-hw-signer-sdk](https://github.com/AnyWHR/zcash-hw-signer) | Rust SDK for HWP protocol (companion app integration) |
 
 ## Project Structure
@@ -306,8 +306,12 @@ Binary framed serial protocol over USB CDC at 115200 baud. `HWP_VERSION = 0x02` 
 
 **TX_OUTPUT data layout** depends on `index`:
 
-- `index = 0xFFFF` (TxMeta, 133 bytes): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE] || anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
-- `index = 0..N-1` (Orchard action, v4, 903 bytes): `cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32]`. The trailing 83 bytes (note plaintext) let the device recompute `cmx` and verify it commits to the claimed recipient/value/rseed.
+Since NU6.3 the device speaks the **v6 tier only**: legacy pre-v6 layouts
+are rejected (`SIGNER_ERR_BAD_META` for the metadata, `BAD_FRAME` for
+untagged actions).
+
+- `index = 0xFFFF` (TxMeta, 166/170 bytes): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE] || anchor[32] || ironwood_flags[1] || ironwood_value_balance[8 LE] || ironwood_anchor[32] || transparent_sig_digest[32] || sapling_digest[32] [|| coin_type[4 LE]]`
+- `index = 0..N-1` (shielded action, pool-tagged): `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] [|| memo[512]]` — **904 bytes** compact or **1416 bytes** memo-verifying; `pool_tag` is `0x00` (sealed Orchard) or `0x01` (Ironwood). The note-plaintext trailer lets the device recompute `cmx` and verify it commits to the claimed recipient/value/rseed; with the memo present it also recomputes `enc_ciphertext` + `epk`, closing memo substitution.
 - `index = N` (sentinel, 32 bytes): expected ZIP-244 sighash for device comparison.
 
 ### Error codes (selected)

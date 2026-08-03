@@ -265,9 +265,9 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
             return;
         }
         if (serr == SIGNER_ERR_SAPLING_NOT_EMPTY) {
-            ESP_LOGE(TAG, "Sapling components not allowed (Orchard-only wallet)");
+            ESP_LOGE(TAG, "Sapling components not allowed (Orchard/Ironwood-only wallet)");
             send_error(seq, HWP_ERR_SAPLING_NOT_EMPTY,
-                       "sapling components not allowed (Orchard-only)");
+                       "sapling components not allowed (Orchard/Ironwood only)");
             session_reset();
             return;
         }
@@ -316,8 +316,7 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
 
         /* Log all intermediate digests for debug */
         {
-            uint8_t hdr[32], orch[32], dbg_sighash[32];
-            Zip244ActionsState dbg_actions = signer_ctx.actions_state;
+            uint8_t hdr[32], dbg_sighash[32];
 
             zip244_header_digest(&signer_ctx.tx_meta, hdr);
             ESP_LOGI(TAG, "header_digest:");
@@ -327,13 +326,16 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
             ESP_LOGI(TAG, "sapling_digest (from companion):");
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, signer_ctx.tx_meta.sapling_digest, 32, ESP_LOG_INFO);
 
-            zip244_orchard_digest(&dbg_actions, &signer_ctx.tx_meta, orch);
-            ESP_LOGI(TAG, "orchard_digest (computed by device):");
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, orch, 32, ESP_LOG_INFO);
-
-            /* Recompute full sighash */
-            Zip244ActionsState dbg_actions2 = signer_ctx.actions_state;
-            zip244_shielded_sighash(&signer_ctx.tx_meta, &dbg_actions2, dbg_sighash);
+            /* v6 (NU6.3 / Ironwood) is the only accepted tier: the sighash
+             * spans both shielded-pool leaves. Work on copies so verify()
+             * below still owns the live digest states. */
+            {
+                Zip244ActionsState dbg_orchard  = signer_ctx.actions_state;
+                Zip244ActionsState dbg_ironwood = signer_ctx.ironwood_actions_state;
+                zip244_shielded_sighash_v6(&signer_ctx.tx_meta,
+                                           &dbg_orchard, &dbg_ironwood,
+                                           dbg_sighash);
+            }
             ESP_LOGI(TAG, "Device sighash:");
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, dbg_sighash, 32, ESP_LOG_INFO);
             ESP_LOGI(TAG, "Companion sighash:");
@@ -366,17 +368,84 @@ static void handle_tx_output(uint8_t seq, const uint8_t *payload, uint16_t paylo
      * could put a cmx that commits to (attacker_address, value) inside the action
      * while telling the user's UI "send to <Mario>". We recompute cmx on-device
      * from the (recipient, value, rseed) the companion claims and require it to
-     * match the cmx field of the action bytes. */
-    HwpActionV4 av4;
-    if (!hwp_parse_action_v4(out.output_data, out.output_data_len, &av4)) {
+     * match the cmx field of the action bytes.
+     *
+     * v6-only (post-NU6.3): every action payload MUST carry a 1-byte pool
+     * tag (0x00 = sealed Orchard, 0x01 = Ironwood) followed by the compact
+     * body — 904 bytes on the wire. Legacy untagged payloads (903 B v4,
+     * 1415 B v5) are rejected by the size gate below, mirroring the
+     * library dispatcher. The tag routes the action into the matching
+     * ZIP-244 pool digest tree. */
+    if (out.output_data_len != HWP_ACTION_DATA_SIZE_V6 &&
+        out.output_data_len != HWP_ACTION_DATA_SIZE_V6_COMPACT) {
+        ESP_LOGE(TAG, "Action payload is %u bytes, expected %d or %d (v6 pool-tagged)",
+                 (unsigned)out.output_data_len,
+                 HWP_ACTION_DATA_SIZE_V6_COMPACT, HWP_ACTION_DATA_SIZE_V6);
         send_error(seq, HWP_ERR_BAD_FRAME,
-                   "action payload must be 903 bytes (820 action + 43 recipient + 8 value + 32 rseed)");
+                   "action payload must be v6 pool-tagged (904 bytes compact, "
+                   "or 1416 bytes with memo)");
         session_reset();
         return;
     }
-    serr = orchard_signer_feed_action_with_note(
-        &signer_ctx, av4.action, HWP_ACTION_DATA_SIZE,
-        av4.recipient, av4.value, av4.rseed);
+    if (out.output_data[0] > ZIP244_POOL_IRONWOOD) {
+        send_error(seq, HWP_ERR_BAD_FRAME, "bad v6 action pool tag");
+        session_reset();
+        return;
+    }
+    Zip244Pool pool = (Zip244Pool)out.output_data[0];
+    const uint8_t *adata = out.output_data + HWP_POOL_TAG_SIZE;
+    size_t alen = (size_t)out.output_data_len - HWP_POOL_TAG_SIZE;
+
+    /* Memo-carrying body: additionally recompute enc_ciphertext + epk
+     * on-device, closing the memo-substitution attack that cmx alone
+     * leaves open. The host sends this form whenever it could recover the
+     * memo through the device OVK (the normal flow); the compact form is
+     * the fallback for OVK-None outputs. */
+    if (alen == HWP_ACTION_BODY_MEMO_SIZE) {
+        HwpActionV5 av5;
+        if (!hwp_parse_action_v5(adata, (uint16_t)alen, &av5)) {
+            send_error(seq, HWP_ERR_BAD_FRAME, "action memo-body size mismatch");
+            session_reset();
+            return;
+        }
+        serr = orchard_signer_feed_action_with_note_and_memo(
+            &signer_ctx, pool, av5.action, HWP_ACTION_DATA_SIZE,
+            av5.recipient, av5.value, av5.rseed, av5.memo);
+        if (serr == SIGNER_ERR_MEMO_MISMATCH) {
+            ESP_LOGE(TAG, "Action %d/%d: memo mismatch — enc_ciphertext does not "
+                          "commit to the claimed memo",
+                     out.output_index + 1, out.total_outputs);
+            send_error(seq, HWP_ERR_MEMO_MISMATCH,
+                       "action enc_ciphertext does not commit to claimed memo");
+            session_reset();
+            return;
+        }
+        if (serr == SIGNER_ERR_BAD_PK_D) {
+            ESP_LOGE(TAG, "Action %d/%d: recipient pk_d is not a valid Pallas point",
+                     out.output_index + 1, out.total_outputs);
+            send_error(seq, HWP_ERR_BAD_PK_D, "claimed recipient pk_d is invalid");
+            session_reset();
+            return;
+        }
+    } else {
+        HwpActionV4 av4;
+        if (!hwp_parse_action_v4(adata, (uint16_t)alen, &av4)) {
+            send_error(seq, HWP_ERR_BAD_FRAME, "action body size mismatch");
+            session_reset();
+            return;
+        }
+        serr = orchard_signer_feed_action_with_note(
+            &signer_ctx, pool, av4.action, HWP_ACTION_DATA_SIZE,
+            av4.recipient, av4.value, av4.rseed);
+    }
+    if (serr == SIGNER_ERR_BAD_POOL) {
+        ESP_LOGE(TAG, "Action %d/%d: pool tag invalid for this session",
+                 out.output_index + 1, out.total_outputs);
+        send_error(seq, HWP_ERR_BAD_FRAME,
+                   "action pool tag invalid for this session");
+        session_reset();
+        return;
+    }
     if (serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
         ESP_LOGE(TAG, "Action %d/%d: NoteCommitment mismatch — recipient substitution attempt",
                  out.output_index + 1, out.total_outputs);
@@ -853,7 +922,7 @@ static void usb_monitor_task(void *arg)
             if (device_ready) {
                 led_status_set(LED_STATE_CONNECTED);
                 ESP_LOGI(TAG, "========================================");
-                ESP_LOGI(TAG, " Zcash Orchard Hardware Wallet");
+                ESP_LOGI(TAG, " Zcash Orchard/Ironwood Hardware Wallet");
                 ESP_LOGI(TAG, " HWP v%d | Target: ESP32-S2", HWP_VERSION);
                 ESP_LOGI(TAG, " Wallet: READY%s",
                          wallet_is_backed_up() ? "" : " [NOT BACKED UP]");
@@ -892,7 +961,7 @@ static void fatal_halt(const char *reason)
 void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, " Zcash Orchard Hardware Wallet");
+    ESP_LOGI(TAG, " Zcash Orchard/Ironwood Hardware Wallet");
     ESP_LOGI(TAG, " HWP v%d | Target: ESP32-S2", HWP_VERSION);
     ESP_LOGI(TAG, "========================================");
 
