@@ -1,5 +1,18 @@
 menu "Zcash HW Wallet"
 
+config ZCASH_NETWORK_MAINNET
+    bool "Device network: MAINNET (default: testnet)"
+    default n
+    help
+        The network this firmware derives keys for and signs on. It is fixed
+        at build time: the companion can query it but cannot change it, and
+        a transaction whose metadata names the other network is refused.
+
+        Leave this off. This firmware runs on a development board with no
+        display of its own, no secure element and (by default) no secure
+        boot or flash encryption: it is a reference port, not a hardware
+        wallet. See README.md, "What this is not".
+
 config DEBUG_LOG_SECRETS
     bool "Log prefixes of secret-bearing material (DEV ONLY)"
     default n

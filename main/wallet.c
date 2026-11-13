@@ -240,9 +240,33 @@ static WalletError derive_seed(uint8_t seed[64])
     return WALLET_OK;
 }
 
-WalletError wallet_get_seed(uint8_t seed_out[64])
+/* wallet_get_seed() was removed with transparent signing: nothing outside
+ * this file needs the BIP-39 seed any more, and no transparent (BIP-32 /
+ * secp256k1) key is derived anywhere in this firmware. */
+
+WalletError wallet_derive_fvk(uint8_t fvk_out[96], uint32_t coin_type)
 {
-    return derive_seed(seed_out);
+    uint8_t seed[64];
+    WalletError werr = derive_seed(seed);
+    if (werr != WALLET_OK) return werr;
+
+    uint8_t sk[32];
+    orchard_derive_account_sk(seed, coin_type, ZCASH_ACCOUNT, sk);
+    memzero(seed, sizeof(seed));
+
+    uint8_t ask[32], nk[32], rivk[32], ak[32];
+    orchard_derive_keys(sk, ask, nk, rivk);
+    memzero(sk, sizeof(sk));
+    redpallas_derive_ak(ask, ak);
+    memzero(ask, sizeof(ask));
+
+    memcpy(fvk_out,      ak,   32);
+    memcpy(fvk_out + 32, nk,   32);
+    memcpy(fvk_out + 64, rivk, 32);
+    memzero(ak, sizeof(ak));
+    memzero(nk, sizeof(nk));
+    memzero(rivk, sizeof(rivk));
+    return WALLET_OK;
 }
 
 WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type)
@@ -311,9 +335,15 @@ WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type)
 
 WalletError wallet_get_address(char *ua_out, size_t ua_len, uint32_t coin_type)
 {
-    /* Build NVS cache key per coin_type */
-    char ua_key[16];
-    snprintf(ua_key, sizeof(ua_key), "ua_%u", (unsigned)coin_type);
+    /* NVS cache key per coin_type. The key name carries a format version:
+     * "ua_<coin>" was written by firmware built on library releases up to
+     * a55d168, whose default address differs from the standard one for
+     * about half of all seeds (libzcash-ironwood-c README, "Default address
+     * conformance"). That entry is never returned any more; it is only
+     * compared, so the user is told when the address changed. */
+    char ua_key[16], old_key[16];
+    snprintf(ua_key, sizeof(ua_key), "ua2_%u", (unsigned)coin_type);
+    snprintf(old_key, sizeof(old_key), "ua_%u", (unsigned)coin_type);
 
     /* Try NVS cache first */
     nvs_handle_t h;
@@ -344,8 +374,19 @@ WalletError wallet_get_address(char *ua_out, size_t ua_len, uint32_t coin_type)
         return WALLET_ERR_SIGN_FAILED;
     }
 
-    /* Cache in NVS keyed by coin_type */
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        /* An address cached by older firmware that differs from the one
+         * derived now: say so once, and keep the old entry untouched. */
+        static char old_ua[256];
+        size_t old_len = sizeof(old_ua);
+        if (nvs_get_str(h, old_key, old_ua, &old_len) == ESP_OK && old_len > 1 &&
+            strcmp(old_ua, ua_out) != 0) {
+            ESP_LOGW(TAG, "DEFAULT ADDRESS CHANGED with this firmware (library address-format fix).");
+            ESP_LOGW(TAG, "  previously shown: %s", old_ua);
+            ESP_LOGW(TAG, "  now:              %s", ua_out);
+            ESP_LOGW(TAG, "  If the wallet (seed) is the same, the previous address is still");
+            ESP_LOGW(TAG, "  this wallet's; the new one is what host wallets show as default.");
+        }
         nvs_set_str(h, ua_key, ua_out);
         nvs_commit(h);
         nvs_close(h);

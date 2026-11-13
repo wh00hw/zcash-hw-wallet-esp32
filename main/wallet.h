@@ -12,8 +12,23 @@
 /** Default account index */
 #define ZCASH_ACCOUNT     0
 
-/** Default coin type used when FvkReq has no payload (backward compat). */
-#define ZCASH_DEFAULT_COIN_TYPE  1
+/**
+ * The device's network, as the ZIP 32 coin type: 1 = testnet (default),
+ * 133 = mainnet (menuconfig: Zcash HW Wallet -> CONFIG_ZCASH_NETWORK_MAINNET).
+ *
+ * It is a build-time property of the firmware. The host can ask which
+ * network the device is on (FVK_REQ) but cannot choose it: keys are derived
+ * for this coin type only, and the signer refuses a transaction whose
+ * metadata names the other one.
+ */
+#include "sdkconfig.h"
+#ifdef CONFIG_ZCASH_NETWORK_MAINNET
+#define ZCASH_DEVICE_COIN_TYPE  133
+#else
+#define ZCASH_DEVICE_COIN_TYPE  1
+#endif
+/** Older name, kept for the call sites that predate the fixed network. */
+#define ZCASH_DEFAULT_COIN_TYPE  ZCASH_DEVICE_COIN_TYPE
 
 /** PIN length, in digits. Each digit is 0..9 in a uint8_t.
  *  Trade-off: 5 digits gives 100k combinations, lockout=10 attempts wipes. */
@@ -74,15 +89,18 @@ WalletError wallet_import(const char *mnemonic);
 WalletError wallet_get_fvk(uint8_t fvk_out[96], uint32_t coin_type);
 
 /**
- * Derive the 64-byte BIP-39 seed from the NVS-stored mnemonic.
+ * Derive the full viewing key from the PIN-unsealed mnemonic in RAM,
+ * WITHOUT consulting or updating the NVS cache.
  *
- * Required by the transparent ECDSA signing path, which needs the raw
- * seed for BIP-32 derivation. Caller MUST memzero the seed buffer
- * after use; the seed is the master secret.
+ * This is the key the signer classifies outputs against ("is this output
+ * the wallet's own change?"), so it must not come from storage an attacker
+ * could have rewritten: the NVS cache used by wallet_get_fvk() is neither
+ * encrypted nor authenticated.
  *
- * @param seed_out  64-byte output buffer
+ * @param fvk_out    96-byte output buffer (ak || nk || rivk)
+ * @param coin_type  ZIP-32 coin type (133 = mainnet, 1 = testnet)
  */
-WalletError wallet_get_seed(uint8_t seed_out[64]);
+WalletError wallet_derive_fvk(uint8_t fvk_out[96], uint32_t coin_type);
 
 /**
  * Derive a Unified Address string.

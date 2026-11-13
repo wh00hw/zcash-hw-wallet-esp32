@@ -8,10 +8,14 @@ set(LIB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/lib")
 # (aescrypt/aeskey/aes_modes/aestab) are no longer in the build.
 #
 # H-5 (PIN-protected wallet) is implemented via aead.c + wallet_lockout.c
-# from the library. base58.c and hwp_dispatcher.c are also shipped by
-# upstream but the ESP32 firmware drives its own dispatch loop in main.c
-# and does not encode t-addrs on-device, so they are intentionally
-# excluded from the build to save flash.
+# from the library. hwp_dispatcher.c is also shipped by upstream but the
+# ESP32 firmware drives its own dispatch loop in main.c, so it is
+# excluded. base58.c IS built: transparent outputs (shielded -> t-address
+# payments) are shown to the user as t-addresses before signing.
+#
+# bip32.c and secp256k1.c are deliberately NOT built: this firmware derives
+# no transparent key and signs no transparent input (the library refuses
+# them: SIGNER_ERR_TRANSPARENT_INPUTS_UNSUPPORTED).
 set(SRCS
     "${LIB_ROOT}/src/orchard.c"
     "${LIB_ROOT}/src/pallas.c"
@@ -30,8 +34,7 @@ set(SRCS
     "${LIB_ROOT}/src/hwp.c"
     "${LIB_ROOT}/src/zip244.c"
     "${LIB_ROOT}/src/orchard_signer.c"
-    "${LIB_ROOT}/src/bip32.c"
-    "${LIB_ROOT}/src/secp256k1.c"
+    "${LIB_ROOT}/src/base58.c"
     "${LIB_ROOT}/src/aes/aes_ct.c"
     "${LIB_ROOT}/src/aead.c"
     "${LIB_ROOT}/src/chacha20poly1305.c"

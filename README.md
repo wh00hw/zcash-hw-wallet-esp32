@@ -1,39 +1,168 @@
-# Zcash Orchard Hardware Wallet PoC — ESP32-S2
+# Zcash Orchard/Ironwood signer — ESP32-S2 reference port
 
-> **Proof of Concept / Educational Project**
->
-> This is a **non-production** hardware wallet that demonstrates Zcash Orchard shielded transaction signing on a microcontroller. It is **NOT** anti-tampering and does **NOT** use a secure element. The BIP-39 mnemonic is sealed under a 5-digit PIN (AES-256-CTR + HMAC-SHA256, PBKDF2-HMAC-SHA512 ≈ 1 s on this target), but anyone who can read the NVS partition off the SoC can run an offline brute force against 100 000 PIN candidates. **Do not use this with real funds.** It exists purely as a reference implementation and learning tool for Zcash shielded hardware signing.
+> **This is not a hardware wallet.** It is a reference port of the
+> [libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c) signing library to an
+> ESP32-S2 development board, for protocol and library demonstrations. **Do not use it with
+> real funds.** See [What this is not](#what-this-is-not).
 
-## What This Is
+> **Status (November 2026).** Ported to the November 2026 library API (on-device change
+> detection, totals confirmation, transparent signing removed). The firmware **builds** with
+> ESP-IDF v5.3 against library commit `65a8425` (the submodule pin), with no compiler warnings
+> in the application or library components. It has **not been flashed or run since the port**: everything below
+> about behaviour on the board describes what the code does, not something observed.
+> The previous revision (3765ea5, library a55d168) could not complete a signature at all — see
+> [Changes](#changes-november-2026).
 
-A complete, working Zcash Orchard hardware wallet firmware for the **Flipper Zero WiFi Dev Board v1** (ESP32-S2). Communicates via the HWP (Hardware Wallet Protocol) binary protocol over USB. Any companion app built on the [zcash-hw-signer-sdk](https://github.com/wh00hw/zcash-hw-signer-sdk) Rust SDK can pair with and sign transactions through this device.
+## What this is
+
+Firmware for the **Flipper Zero WiFi Dev Board v1** (ESP32-S2) that speaks the device side of
+HWP (Hardware Wallet Protocol) over USB. A companion built on the
+[zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) Rust SDK can pair with it and
+have shielded (Orchard / Ironwood, NU6.3) spends signed.
+
+It uses the library's signer API directly (`orchard_signer.h`), with its own message loop in
+`main/main.c`, rather than the library's `hwp_dispatcher`.
 
 The firmware:
 
-- Generates a BIP-39 24-word mnemonic on first boot
-- Seals the mnemonic under a user-chosen **5-digit PIN** (audit H-5) — wipe-on-lockout after 10 wrong attempts
-- Derives Zcash Orchard keys via ZIP-32 (Pallas curve, Sinsemilla hash)
-- Caches derived keys (FVK, UA) in NVS for instant subsequent boots
-- Signs shielded transactions with RedPallas spend authorization
-- Signs transparent inputs (ECDSA secp256k1) so shielded → t-addr sweeps work end-to-end
-- Provides a long-term **device identity** + per-session **attestation** (audit M1) the companion can pin to detect device substitution
-- **ZIP-244 on-device sighash verification** — recomputes `header_digest` / `orchard_digest` / `transparent_sig_digest` on-device; enforces `sapling_digest` equal to the ZIP-244 empty-bundle constant
-- **NoteCommitment (cmx) verification** — recomputes Sinsemilla NoteCommit per Orchard action from the unencrypted note plaintext (recipient, value, rseed) and rejects recipient-substitution attempts before any data is shown to the user
-- **Per-output user confirmation** — for each Orchard output, displays the recipient (encoded as a Bech32m Unified Address) and value, requires an explicit BOOT-button press, and blocks signing until the libzcash signer state machine has every action confirmed
-- **SIGN_REQ recipient cross-check** — the UA the companion advertises in `SIGN_REQ.recipient` is decoded on-device and compared (constant-time) against the recipients of the confirmed actions; mismatch refuses to sign
-- **Constant-time AES-256** — FF1 diversifier derivation routes through the library's audit H-3 `aes_ct` constant-time AES, then is overridden at boot to dispatch through the ESP32-S2 HW AES peripheral (also constant-time, ~10× faster)
-- **Sinsemilla S-table integrity check** — at boot, walks the 1024 lookup entries and verifies their BLAKE2b-256 against the library's canonical fingerprint (audit M-5). On mismatch the device refuses to operate.
-- **No-blind-signing invariant enforced by the C library** — the device cannot produce a signature unless sapling-empty + cmx-match + user-confirm + sighash-match all pass. Skipping any of them returns a typed error before RedPallas is invoked.
-- Speaks HWP over **dual USB CDC** (one port for protocol, one for debug logs)
-- Never exposes the spending key — only the full viewing key leaves the device
+- generates a BIP-39 24-word mnemonic on first boot and seals it in NVS under a 5-digit PIN
+  (AES-256-CTR + HMAC-SHA256, PBKDF2-HMAC-SHA512); 10 wrong PINs wipe the wallet;
+- derives the Orchard keys via ZIP-32 for **one network, fixed at build time** (testnet unless
+  `CONFIG_ZCASH_NETWORK_MAINNET` is set);
+- exports the full viewing key to the companion (`FVK_RSP`);
+- for each transaction, lets the library recompute the sighash, every note commitment and every
+  ciphertext, classify each output as the wallet's own or not, and compute the totals;
+- prints the review (outputs, memos, totals) to its **log port** and waits for the BOOT button
+  for each step;
+- signs with RedPallas only after the library's state machine has reached `SIGNER_VERIFIED`;
+- answers device identity / attestation requests.
+
+## What this is not
+
+- **There is no display.** The board has one button and one LED. Everything the firmware
+  "shows" for review — addresses, amounts, memos, totals — is written with `ESP_LOG*` to the
+  second USB serial port (`/dev/ttyACM1`), i.e. **to the same computer that runs the
+  companion**. A compromised host can hide or rewrite that text. Pressing BOOT therefore
+  proves that someone pressed a button; it does not prove that they saw what the device
+  verified. The property a hardware wallet exists to provide — a trusted screen — is absent.
+- **The mnemonic is printed to that same log port** at first boot (and the PIN is entered by
+  tap-count on the BOOT button).
+- **No secure element, no tamper resistance.** Flash encryption and secure boot are not enabled
+  by default; NVS encryption is off. Anyone who can read the flash gets the PIN-sealed mnemonic
+  and can try all 100,000 PINs offline; anyone who can write it can replace the firmware.
+- **Not audited.**
+
+What is stored in NVS, all of it unencrypted at the NVS layer:
+
+| Entry | Content | Protection |
+|---|---|---|
+| `pin_salt`, `pin_nonce`, `pin_tag`, `pin_sealed` | the mnemonic, sealed | AEAD under the PIN-derived key (5 digits: offline brute force is cheap) |
+| `lockout` | failed-PIN counter | none (erasing it resets the counter) |
+| `fvk_<coin>` | full viewing key `ak ‖ nk ‖ rivk` | **cleartext**. Not a spending key, but it reveals every incoming and outgoing transaction of the wallet |
+| `ua2_<coin>` (and `ua_<coin>` from older firmware) | default Unified Address | cleartext |
+| `device_sk` | device-identity secret scalar (attestation) | **cleartext**. Whoever reads the flash can impersonate this device's identity |
+| `backed_up` | flag | — |
+
+No spending key (`ask`), seed or mnemonic is stored in the clear. The cached FVK and address
+are neither encrypted nor authenticated: someone who can rewrite the flash can make the device
+announce a different viewing key or address at pairing. For that reason the signer does **not**
+use the cache to decide which outputs are the wallet's own — it derives the viewing key from
+the PIN-unsealed mnemonic for every transaction (`wallet_derive_fvk()`). The cache is still
+what `FVK_RSP` and the boot banner use.
+
+## Transparent inputs are not supported
+
+The firmware signs **shielded spends only**. A frame announcing a transparent input is passed
+to the library, which refuses it (`SIGNER_ERR_TRANSPARENT_INPUTS_UNSUPPORTED`, HWP error
+`0x18`); `TRANSPARENT_SIGN_REQ` is always refused with the same error. No transparent key is
+derived (the BIP-32 and secp256k1 sources are not compiled in) and no transparent public key
+is ever sent.
+
+Earlier versions of this README claimed ECDSA signing of transparent inputs. That code is gone
+from the firmware and disabled in the library, for the reasons the library's README gives:
+what was signed for a transparent input was not the transaction's ZIP 244 signature hash (the
+signatures were invalid on chain), a secp256k1 arithmetic bug made every derived public key
+wrong (fixed since; the signing code stays disabled), and the scalar multiplication is not
+constant-time in the nonce. Per the library, a transparent public key or t-address obtained
+from an earlier revision is not the one the seed's standard BIP-44 key controls — do not use
+one.
+
+Paying **to** a transparent address from shielded funds is supported: the transparent outputs
+are hashed into the transparent digest, printed as t-addresses in the review, and counted as
+leaving the wallet. (The previous revision hashed them but never printed them.)
+
+## The review
+
+After the companion has streamed the transaction and sent the sighash sentinel, the firmware
+prints, on `/dev/ttyACM1`, one block per step and waits up to 2 minutes for the BOOT button
+(short press = approve, hold ≥ 2 s = cancel; cancel or timeout aborts the session):
+
+```
+[1/3] t-address PAYMENT - LEAVES THE WALLET            (transparent outputs first)
+    Value: 1.50000000 TAZ (150000000 zatoshis)
+    To:    tm...
+[2/3] PAYMENT - LEAVES THE WALLET                      (shielded, not this wallet's)
+    Value: 0.50000000 TAZ (50000000 zatoshis)
+    To:    utest1...
+    CHECK THIS ADDRESS: it is not one of this wallet's.
+    Memo:  none                                        (or the memo, in full)
+[3/3] CHANGE (your wallet)                             (decided on-device from its keys)
+    Value: 0.49990000 TAZ (49990000 zatoshis)
+    Memo:  none
+TOTALS (computed on the device)
+    TOTAL LEAVING THE WALLET: 2.00010000 TAZ
+      of which fee:           0.00010000 TAZ
+    payments to others: 1 shielded, 1 transparent
+    change returning:         0.49990000 TAZ
+    zero-value padding outputs (not shown): 0
+```
+
+- The label of each shielded output comes from the library's classification
+  (`OrchardOutputInfo.ownership`): `CHANGE (your wallet)`, `YOUR ADDRESS` (one of the wallet's
+  own receiving addresses), or a payment / message to an address that is not the wallet's.
+  Nothing the host says is used for it.
+- Outputs with `review_required == false` (zero value, verified to carry no memo — padding) are
+  skipped; the library has already confirmed them and counts them in the totals.
+- A memo is printed in full: text as printable ASCII (other bytes as `?`), anything else as hex.
+- An amount above 21 million coins (it cannot exist on chain) is not printed: the review is
+  refused and the session aborted.
+- Approving the totals is the last confirmation: the firmware then calls
+  `orchard_signer_confirm_totals()` and `orchard_signer_verify()`, and subsequent `SIGN_REQ`s
+  are answered without a further prompt — at most one signature per action, after which the
+  session is reset. The amount, fee and recipient fields of `SIGN_REQ` are ignored.
+
+### What the library verifies
+
+These are the library's claims (its README and `SECURITY.md`), not stronger ones:
+
+- the device signs only the ZIP-244 (v6) sighash it computed itself; the header must be v6 with
+  a consensus branch on the allow-list (NU6.3 and NU7 by default); Sapling must be empty; the
+  transparent digest is recomputed from the streamed transparent outputs or must be empty;
+- recipient and value of every output are recomputed through the note commitment;
+- the ciphertext, memo included, of every output that carries value is re-encrypted and compared;
+- whether an output is the wallet's change or own address is decided on-device from the
+  device's own keys;
+- fee and total leaving are computed on-device from data bound by the sighash; the total is an
+  upper bound on what the wallet loses;
+- `verify()` refuses until every output with a value or a memo, and the totals, were confirmed;
+  `sign()` refuses before `verify()` succeeded.
+
+### What is not verified
+
+- the spend side (which notes are spent, their values, nullifiers, anchors) and the Halo 2 proof;
+- expiry height and lock time: bound by the sighash, not printed;
+- whether a transparent output is the wallet's own (always shown as leaving);
+- **that the user saw the review** — see [What this is not](#what-this-is-not). The library
+  orders the steps; it is not a barrier against the firmware, which holds the spending key and
+  could bypass the library deliberately.
 
 ## Architecture
 
 ```
-                    USB Cable (single)
+                    USB cable (single)
                     ┌────────────────────┐
                     │  /dev/ttyACM0      │  HWP binary protocol (companion app)
-  ┌──────────┐      │  /dev/ttyACM1      │  Debug logs (ESP_LOG*)
+  ┌──────────┐      │  /dev/ttyACM1      │  logs AND the review text (ESP_LOG*)
   │ ESP32-S2 ├──────┤                    ├──────── Host PC
   │ WiFi Dev │      │  Dual USB CDC      │
   │ Board v1 │      │  (TinyUSB)         │
@@ -44,29 +173,28 @@ The firmware:
 
 | Component | Description |
 |---|---|
-| [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/) | Espressif IoT Development Framework (tested with v5.3) |
-| [libzcash-orchard-c](https://github.com/wh00hw/libzcash-ironwood-c) | Pure-C Zcash Orchard crypto (included as git submodule under `components/libzcash-orchard-c/lib`) |
-| [zcash-hw-signer-sdk](https://github.com/AnyWHR/zcash-hw-signer) | Rust SDK for HWP protocol (companion app integration) |
+| [ESP-IDF v5.x](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/) | Espressif IoT Development Framework (built with v5.3) |
+| [libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c) | Pure-C Zcash Orchard/Ironwood signing library, git submodule under `components/libzcash-ironwood-c/lib`. **Needs `17d4ee0` or later** (November 2026 API); this source does not compile against the older pin a55d168 |
+| [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) | Rust SDK for the host side of HWP |
 
-## Project Structure
+## Project structure
 
 ```
 zcash-esp32/
 ├── CMakeLists.txt                          # ESP-IDF project root
 ├── sdkconfig.defaults                      # ESP32-S2 build defaults
 ├── main/
-│   ├── CMakeLists.txt                      # Main component build
-│   ├── main.c                              # Entry point, HWP command handler
-│   ├── wallet.h / wallet.c                 # Key management (NVS + Orchard derivation + PIN flow + attestation)
-│   ├── user_input.h / user_input.c         # BOOT-button driver (single press, long press, PIN tap-count)
+│   ├── main.c                              # Entry point, HWP message loop, review
+│   ├── wallet.h / wallet.c                 # NVS storage, PIN flow, key derivation, attestation
+│   ├── user_input.h / user_input.c         # BOOT-button driver (press, long press, PIN tap-count)
 │   ├── usb_transport.h / usb_transport.c   # Dual USB CDC driver (HWP + logs)
 │   ├── led_status.h / led_status.c         # RGB LED status indicator
-│   └── Kconfig.projbuild                   # `CONFIG_DEBUG_LOG_SECRETS` toggle
+│   └── Kconfig.projbuild                   # CONFIG_ZCASH_NETWORK_MAINNET, CONFIG_DEBUG_LOG_SECRETS
 ├── components/
-│   └── libzcash-orchard-c/
-│       ├── CMakeLists.txt                  # ESP-IDF component wrapper
+│   └── libzcash-ironwood-c/
+│       ├── CMakeLists.txt                  # ESP-IDF component wrapper (source list)
 │       ├── platform_rng.c                  # esp_random() → random32() bridge
-│       └── lib/                            # Git submodule → libzcash-orchard-c
+│       └── lib/                            # Git submodule → libzcash-ironwood-c
 └── tools/                                  # Host-side test scripts
 ```
 
@@ -74,32 +202,24 @@ zcash-esp32/
 
 ### 1. Install ESP-IDF
 
-Follow the [official guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/) for your platform. This project requires ESP-IDF **v5.x** (tested with v5.3).
+Follow the [official guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/). ESP-IDF **v5.x** (built with v5.3).
 
 ```bash
-# After installation, source the environment
 . $HOME/esp/esp-idf/export.sh
 ```
 
-### 2. Clone with Submodules
+### 2. Clone with submodules
 
 ```bash
 git clone --recurse-submodules https://github.com/wh00hw/zcash-hw-wallet-esp32.git
 cd zcash-hw-wallet-esp32
 ```
 
-If you already cloned without `--recurse-submodules`:
+To move the vendored library to a newer commit:
 
 ```bash
-git submodule update --init --recursive
-```
-
-To pull the latest libzcash-orchard-c into the vendored submodule:
-
-```bash
-git submodule update --remote components/libzcash-orchard-c/lib
-git add components/libzcash-orchard-c/lib
-git commit -m "bump libzcash-orchard-c"
+git submodule update --remote components/libzcash-ironwood-c/lib
+git add components/libzcash-ironwood-c/lib
 ```
 
 ### 3. Build
@@ -109,252 +229,182 @@ idf.py set-target esp32s2
 idf.py build
 ```
 
-The default sdkconfig enables stack canaries, heap poisoning, and OTA anti-rollback (see `sdkconfig.defaults`). WiFi and Bluetooth are forced off in the binary.
+The device's network is a build option: `idf.py menuconfig` → *Zcash HW Wallet* →
+*Device network: MAINNET*. Default is testnet; leave it there.
+
+`sdkconfig.defaults` enables stack canaries and light heap poisoning and disables WiFi and
+Bluetooth.
 
 ### 4. Flash
 
-The Flipper Zero WiFi Dev Board v1 requires **manual download mode** because the USB is driven by TinyUSB firmware (no auto-reset via DTR/RTS):
+The Flipper Zero WiFi Dev Board v1 needs **manual download mode** (the USB port is driven by
+the firmware's own TinyUSB stack):
 
-1. **Hold BOOT** button on the dev board
-2. **Press and release RESET**
-3. **Release BOOT** — the board is now in download mode
-4. Flash:
+1. Hold **BOOT**, press and release **RESET**, release **BOOT**
+2. `idf.py -p /dev/ttyACM0 flash`
+3. Press **RESET**
 
-```bash
-idf.py -p /dev/ttyACM0 flash
-```
-
-5. Press **RESET** to boot the firmware
-
-To erase everything (including the wallet/mnemonic):
-
-```bash
-# Enter download mode first (BOOT + RESET), then:
-idf.py -p /dev/ttyACM0 erase-flash
-```
+`idf.py -p /dev/ttyACM0 erase-flash` (in download mode) erases everything, wallet included.
 
 ## Usage
 
-### First Boot — Provisioning
+### First boot — provisioning
 
-On first boot (empty NVS), the firmware:
+On first boot (empty NVS) the firmware:
 
-1. Generates a 24-word BIP-39 mnemonic (printed once to ACM1)
-2. **Prompts the user to enter a 5-digit PIN via BOOT-button tap-count** (`N` taps for digit `N`; `10` taps = `0`; ~1.5 s pause confirms each digit; long-press cancels)
-3. Derives a 64-byte AEAD key from the PIN via PBKDF2-HMAC-SHA512 (≈ 1 s)
-4. Seals the mnemonic with AES-256-CTR + HMAC-SHA256 (Encrypt-then-MAC) and persists `salt`, `nonce`, `tag`, `ciphertext` to NVS
-5. Generates the device's long-term **identity scalar** (a fresh Pallas scalar from the CSPRNG, independent of the BIP-39 seed) and prints the resulting 32-byte pubkey hex on ACM1 — record this for pairing
-6. Pre-derives the FVK to warm the Pallas curve and cache the result
+1. generates a 24-word BIP-39 mnemonic and **prints it once to ACM1**;
+2. asks for a 5-digit PIN by BOOT-button tap-count (`N` taps for digit `N`; 10 taps = `0`;
+   a ~1.5 s pause confirms each digit; a long press cancels);
+3. seals the mnemonic (PBKDF2-HMAC-SHA512, 150,000 iterations → AES-256-CTR + HMAC-SHA256) and
+   stores salt, nonce, tag and ciphertext in NVS;
+4. generates the device-identity scalar and prints its public key on ACM1;
+5. derives the FVK and the default address and caches both in NVS.
 
-Open the log port **before** powering the board so you capture both the mnemonic and the identity pubkey:
+Open the log port before powering the board to capture the mnemonic and the identity key:
 
 ```bash
-# Terminal 1: debug logs
 cat /dev/ttyACM1
-
-# Then plug in / reset the board
 ```
 
-The provisioning derivation takes ~80 s on the ESP32-S2; subsequent boots are instant.
+Timings on the board with the current library have not been measured.
 
-### Subsequent Boots — PIN Unlock
+### Later boots — PIN unlock
 
-Every boot after provisioning, the firmware:
+The firmware asks for the PIN, unseals the mnemonic into RAM (where it stays until power-off
+or wipe) and only then accepts HWP traffic. Each wrong PIN increments a counter in NVS; after
+10 in a row the wallet (seed, identity, caches) is wiped and the device halts.
 
-1. Loads the lockout state from NVS
-2. Prompts for the 5-digit PIN via BOOT-button tap-count
-3. Re-derives the AEAD key and attempts to unseal the mnemonic
-4. On success: caches the unsealed mnemonic in RAM, resets the lockout counter, allows HWP traffic
-5. On failure: increments `fail_count`, persists, re-prompts. After `WALLET_PIN_LOCKOUT_MAX = 10` consecutive failures the firmware **wipes the wallet** (seed + identity + cached keys) and halts.
-
-The unsealed mnemonic only ever exists in a static RAM buffer cleared on `wallet_pin_lock()` or wipe.
+If the default address cached by older firmware differs from the one derived now, both are
+printed once with a notice: library releases up to a55d168 derived a different default address
+for about half of all seeds; the old one still belongs to the same wallet.
 
 ### Dual USB CDC
 
-The device exposes **two serial ports** over a single USB cable:
+| Port | Purpose |
+|---|---|
+| `/dev/ttyACM0` | HWP binary protocol (companion, via zcash-hw-wallet-sdk) |
+| `/dev/ttyACM1` | Logs and the review text: `cat /dev/ttyACM1` |
 
-| Port | Purpose | Usage |
-|---|---|---|
-| `/dev/ttyACM0` | HWP binary protocol | Companion app (via zcash-hw-signer-sdk) |
-| `/dev/ttyACM1` | Debug logs (ESP_LOG) | `cat /dev/ttyACM1` or `picocom /dev/ttyACM1 -b 115200` |
-
-### Companion App Integration
-
-Any companion app built with the [zcash-hw-signer-sdk](https://github.com/AnyWHR/zcash-hw-signer) can communicate with this device over `/dev/ttyACM0`. The SDK handles HWP framing, CRC, and handshake automatically.
-
-**Pairing (FVK export):**
+### Protocol flow
 
 ```
 Device  ──PING──→  Companion
 Device  ←─PONG───  Companion
-Device  ←FVK_REQ─  Companion  (coin_type[4 LE])
-Device  ─FVK_RSP─→ Companion  (96 bytes: ak || nk || rivk)
+Device  ←FVK_REQ─  Companion   (coin_type[4 LE]; refused if it names the other network)
+Device  ─FVK_RSP─→ Companion   (ak || nk || rivk)
+
+Device  ←TX_OUTPUT──  Companion   (TxMeta @ index 0xFFFF)                    → ACK
+        [ ←TX_TRANSPARENT_OUTPUT × n, then ←TX_TRANSPARENT_INPUT(0, 0, digest) ]   → ACK each
+Device  ←TX_OUTPUT──  Companion   (action i of N, in order, 1416 bytes)      → ACK each
+Device  ←TX_OUTPUT──  Companion   (sentinel @ index N: expected sighash[32])
+            review on ACM1 + BOOT button, then sighash comparison            → ACK
+Device  ←SIGN_REQ───  Companion   (sighash + alpha [+ amount, fee, recipient: ignored])
+Device  ─SIGN_RSP──→  Companion   (sig[64] || rk[32])       at most one per action
 ```
 
-The companion creates a watch-only wallet from the exported FVK.
+Every `Error` frame the device sends ends the session and wipes the signer state, as does a
+`PING` or `ABORT` from the host and a USB disconnect.
 
-**Device attestation (recommended at every pairing and periodically thereafter):**
+**Device identity / attestation:** `IDENTITY_REQ` → `device_pubkey[32]`; `ATTEST_REQ(challenge[32])`
+→ `sig[64] || rk[32]`, a RedPallas signature with the identity scalar. It shows that the peer
+holds that scalar — which is stored in cleartext in NVS (see above).
 
-```
-Device  ←IDENTITY_REQ──  Companion
-Device  ─IDENTITY_RSP─→  Companion  (device_pubkey[32])
-
-Device  ←ATTEST_REQ─────  Companion  (challenge[32], fresh nonce)
-Device  ─ATTEST_RSP────→  Companion  (sig[64] || rk[32])
-```
-
-`rk == device_pubkey` and the RedPallas signature verifies against the personalised BLAKE2b-256 of the challenge. The companion pins `device_pubkey` and refuses to sign through any device that returns a different one — this catches USB-hub MITM swaps, localhost virtual-device impersonators, and stolen-and-reflashed devices.
-
-**Shielded-only signing:**
-
-```
-Device  ←TX_OUTPUT──  Companion  (TxMeta @ index 0xFFFF)
-Device  →TX_OUTPUT_ACK
-… per action: action[820] || recipient[43] || value[8 LE] || rseed[32] …
-Device  ←TX_OUTPUT──  Companion  (sentinel @ index N: expected sighash[32])
-   ↑ device drives per-output BOOT-button review here
-Device  →TX_OUTPUT_ACK
-
-Device  ←SIGN_REQ─── Companion   (sighash + alpha + amount + fee + recipient UA)
-Device  →SIGN_RSP    (sig[64] || rk[32])
-```
-
-**Shielded → transparent sweep:** after the Orchard actions, the companion streams `TX_TRANSPARENT_INPUT` / `TX_TRANSPARENT_OUTPUT` frames; the device recomputes the transparent digest and matches it against `TxMeta.transparent_sig_digest`, then signs each transparent input with ECDSA secp256k1 via `TRANSPARENT_SIGN_REQ`.
-
-### LED Status
-
-The dev board's RGB LED indicates the current state:
+### LED status
 
 | LED | State (`led_status.h`) |
 |---|---|
 | Blue blinking | `INITIALIZING` / `BUSY_KEY` / `BUSY_SIGN` |
 | Green solid | `READY` / `CONNECTED` |
-| Cyan breathing | `TX_PROGRESS` — receiving outputs |
+| Cyan breathing | `TX_PROGRESS` — receiving a transaction |
 | **Magenta blinking** | **`AWAITING_CONFIRM` — press BOOT to approve, hold to cancel** |
 | Green flash | `SUCCESS` (transient) |
 | Red flash | `ERROR` (transient) |
 
-### Per-Output User Confirmation
-
-After the device has streamed and verified every Orchard action's NoteCommitment but **before** the ZIP-244 sighash is finalized and signing is allowed, the firmware drives a per-output review loop. For each output:
-
-1. Encodes the recipient `(d, pk_d)` into a Bech32m Unified Address via `orchard_encode_ua_raw`
-2. Logs to the debug port (`/dev/ttyACM1`):
-   ```
-   [Output i/N]
-     To:    u1...
-     Value: 0.50000000 ZEC (50000000 zatoshis)
-   → press BOOT to confirm, hold to cancel
-   ```
-3. Sets the LED to magenta blinking (`LED_STATE_AWAITING_CONFIRM`)
-4. Waits up to 2 minutes for a **BOOT button** press (GPIO0):
-   - **Short press** → calls `orchard_signer_confirm_action(idx)`, advances to next output
-   - **Long press (≥ 2 s)** → cancel; signing is aborted with `HWP_ERR_USER_CANCELLED`
-   - **Timeout** → cancel as above
-
-After all outputs are confirmed, the libzcash signer state machine accepts `verify()`, transitions to `SIGNER_VERIFIED`, and a subsequent `SIGN_REQ` produces a signature. Without all confirmations, `orchard_signer_verify()` returns `SIGNER_ERR_ACTION_NOT_CONFIRMED` and `orchard_signer_sign()` returns `NOT_VERIFIED` — the firmware cannot bypass this; it is a C-library state-machine invariant.
-
-> **Note on UX limits.** GPIO0 is the BOOT button on the Flipper WiFi Dev Board v1 — a single momentary push-to-ground input is the only physical control the user has. This is sufficient to enforce the security invariant (refuse-without-confirm) but is a minimal UX. The full per-output UI (screen + 4 buttons + scrollable UA) lives on [FlipZcash](https://github.com/wh00hw/FlipZcash) — the ESP32 reference port is for protocol and library-level demonstrations.
-
-### Test Scripts
+### Test scripts
 
 ```bash
-# Send a PING and wait for PONG
-python3 tools/hwp_ping.py /dev/ttyACM0
-
-# Extended protocol test (PING + FVK request)
-python3 tools/hwp_test.py /dev/ttyACM0
+python3 tools/hwp_ping.py /dev/ttyACM0     # PING / PONG
+python3 tools/hwp_test.py /dev/ttyACM0     # PING + FVK request
 ```
 
-## HWP Protocol
+## HWP
 
-Binary framed serial protocol over USB CDC at 115200 baud. `HWP_VERSION = 0x02` on the wire; the protocol has been extended in place with v3 transparent flow and v4 attestation.
-
-### Frame Format
+Binary framed serial protocol over USB CDC. Frame:
 
 ```
-[MAGIC:1][VERSION:1][SEQ:1][TYPE:1][LENGTH:2 LE][PAYLOAD:N][CRC16:2 LE]
+[MAGIC:0xFB][VERSION:0x02][SEQ:1][TYPE:1][LENGTH:2 LE][PAYLOAD:N][CRC16:2 LE]
 ```
 
-- **MAGIC**: `0xFB`
-- **VERSION**: `0x02`
-- **CRC**: CRC-16/CCITT (poly `0x1021`, init `0xFFFF`)
-- **Max payload**: 1024 bytes (full frame ≤ `HWP_MAX_FRAME = 1032`)
+CRC-16/CCITT (poly `0x1021`, init `0xFFFF`); maximum payload 2048 bytes (library default).
 
-### Message Types
-
-| Type | Value | Direction | Payload |
+| Type | Value | Direction | Payload / behaviour on this firmware |
 |---|---|---|---|
-| PING | `0x01` | Either | (empty) |
-| PONG | `0x02` | Either | (empty) |
-| FVK_REQ | `0x03` | Host → Device | `coin_type[4 LE]` |
+| PING / PONG | `0x01` / `0x02` | either | empty. A PING resets the signing session |
+| FVK_REQ | `0x03` | Host → Device | `coin_type[4 LE]` (optional) |
 | FVK_RSP | `0x04` | Device → Host | `ak[32] \|\| nk[32] \|\| rivk[32]` |
-| SIGN_REQ | `0x05` | Host → Device | `sighash[32] \|\| alpha[32] \|\| amount[8] \|\| fee[8] \|\| recipient_len[1] \|\| recipient[N]` |
+| SIGN_REQ | `0x05` | Host → Device | `sighash[32] \|\| alpha[32] \|\| amount[8] \|\| fee[8] \|\| recipient_len[1] \|\| recipient[N]` — only sighash and alpha are used |
 | SIGN_RSP | `0x06` | Device → Host | `sig[64] \|\| rk[32]` |
 | ERROR | `0x07` | Device → Host | `error_code[1] \|\| message[N]` |
-| TX_OUTPUT | `0x08` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` (see layout) |
-| TX_OUTPUT_ACK | `0x09` | Device → Host | (empty) |
-| ABORT | `0x0A` | Host → Device | (empty) |
-| TX_TRANSPARENT_INPUT | `0x0B` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` (v3) |
-| TX_TRANSPARENT_OUTPUT | `0x0C` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` (v3) |
-| TRANSPARENT_SIGN_REQ | `0x0D` | Host → Device | `input_index[2] \|\| total_inputs[2] \|\| input_data[N]` (v3) |
-| TRANSPARENT_SIGN_RSP | `0x0E` | Device → Host | `der_len[1] \|\| der_sig[N] \|\| sighash_type[1] \|\| pubkey[33]` (v3) |
-| IDENTITY_REQ | `0x0F` | Host → Device | (empty) (v4) |
-| IDENTITY_RSP | `0x10` | Device → Host | `device_pubkey[32]` (v4) |
-| ATTEST_REQ | `0x11` | Host → Device | `challenge[32]` (v4) |
-| ATTEST_RSP | `0x12` | Device → Host | `sig[64] \|\| rk[32]` (v4) |
+| TX_OUTPUT | `0x08` | Host → Device | `index[2] \|\| total[2] \|\| data[N]` (below) |
+| TX_OUTPUT_ACK | `0x09` | Device → Host | empty |
+| ABORT | `0x0A` | Host → Device | empty |
+| TX_TRANSPARENT_INPUT | `0x0B` | Host → Device | accepted only as `(0, 0, digest[32])`, the sentinel closing the transparent outputs; anything announcing an input → error `0x18` |
+| TX_TRANSPARENT_OUTPUT | `0x0C` | Host → Device | `index[2] \|\| total[2] \|\| value[8 LE] \|\| script_len[2 LE] \|\| script[N]`, P2PKH / P2SH only |
+| TRANSPARENT_SIGN_REQ | `0x0D` | Host → Device | always refused, error `0x18` |
+| TRANSPARENT_SIGN_RSP | `0x0E` | — | never sent |
+| IDENTITY_REQ / RSP | `0x0F` / `0x10` | | `device_pubkey[32]` |
+| ATTEST_REQ / RSP | `0x11` / `0x12` | | `challenge[32]` / `sig[64] \|\| rk[32]` |
 
-**TX_OUTPUT data layout** depends on `index`:
+**TX_OUTPUT data** by `index` (v6 tier only):
 
-Since NU6.3 the device speaks the **v6 tier only**: legacy pre-v6 layouts
-are rejected (`SIGNER_ERR_BAD_META` for the metadata, `BAD_FRAME` for
-untagged actions).
+- `0xFFFF` — TxMeta, 170 bytes: `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE] || anchor[32] || ironwood_flags[1] || ironwood_value_balance[8 LE] || ironwood_anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`. The coin type must be the device's.
+- `0..N-1` — one action, in order, **1416 bytes**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`; `pool_tag` is `0x00` (sealed Orchard) or `0x01` (Ironwood). The 904-byte body without memo is refused (error `0x14`).
+- `N` — sentinel, 32 bytes: the companion's sighash.
 
-- `index = 0xFFFF` (TxMeta, 166/170 bytes): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE] || anchor[32] || ironwood_flags[1] || ironwood_value_balance[8 LE] || ironwood_anchor[32] || transparent_sig_digest[32] || sapling_digest[32] [|| coin_type[4 LE]]`
-- `index = 0..N-1` (shielded action, pool-tagged): `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] [|| memo[512]]` — **904 bytes** compact or **1416 bytes** memo-verifying; `pool_tag` is `0x00` (sealed Orchard) or `0x01` (Ironwood). The note-plaintext trailer lets the device recompute `cmx` and verify it commits to the claimed recipient/value/rseed; with the memo present it also recomputes `enc_ciphertext` + `epk`, closing memo substitution.
-- `index = N` (sentinel, 32 bytes): expected ZIP-244 sighash for device comparison.
+Error codes are the library's (`HwpErrorCode` in `hwp.h`); among them `0x05` network mismatch,
+`0x06` user cancelled, `0x09` sighash mismatch, `0x0A` invalid state, `0x0B` transparent digest
+mismatch, `0x0C` Sapling not empty, `0x0D` note commitment mismatch, `0x0F` memo / ciphertext
+mismatch, `0x14` memo required, `0x15` branch not allowed, `0x16` limit exceeded, `0x18`
+transparent inputs unsupported.
 
-### Error codes (selected)
+## Other properties of the firmware
 
-| Code | Name | Meaning |
-|---|---|---|
-| `0x05` | `NetworkMismatch` | `FvkReq.coin_type` ≠ `TxMeta.coin_type` |
-| `0x06` | `UserCancelled` | User long-pressed BOOT during per-output review or timed out |
-| `0x09` | `SighashMismatch` | Device sighash ≠ companion sighash, or `SignReq.sighash` ≠ verified sighash |
-| `0x0A` | `InvalidState` | Unexpected message in current state |
-| `0x0B` | `TransparentDigestMismatch` | Device-recomputed transparent digest ≠ value in TxMeta |
-| `0x0C` | `SaplingNotEmpty` | `sapling_digest` ≠ ZIP-244 empty-bundle constant — Orchard-only invariant violation |
-| `0x0D` | `NoteCommitmentMismatch` | Device-recomputed cmx ≠ action.cmx — recipient-substitution attempt |
-| `0x0E` | `RecipientMismatch` | `SIGN_REQ.recipient` (UA) does not match any confirmed action |
+- **Sinsemilla table integrity** — the embedded S table is checked at boot against the digest
+  compiled into the library; on mismatch the device halts.
+- **AES** — FF1 diversifier derivation goes through the ESP32-S2 AES peripheral (via mbedTLS);
+  the library's software AES is self-tested at boot.
+- **RNG** — `bootloader_random_enable()` is kept on (WiFi/BT are off), for mnemonic generation,
+  AEAD nonces, the identity scalar and signing nonces.
+- **Build hardening** — stack canaries, light heap poisoning, GDB stub disabled.
+- `CONFIG_DEBUG_LOG_SECRETS` (off by default) logs prefixes of secret material to ACM1; never
+  enable it on a wallet that matters.
 
-## Security Considerations
+Constant-time properties are the library's; see its `SECURITY.md` for what was checked and with
+which compilers (for Xtensa: a hand-read of two functions' disassembly, not a full analysis).
 
-This is a **proof of concept**. In a real hardware wallet, you would still want:
+## Changes (November 2026)
 
-- **Secure element** (e.g., ATECC608, Optiga Trust M) for key storage
-- **NVS encryption** (ESP32-S2 lacks HMAC eFuse support, so this is not trivial)
-- **Anti-tampering** mechanisms (tamper-detect mesh, potting, fuses)
-- **Secure boot** with signed firmware images (sdkconfig already enables OTA anti-rollback as a stepping stone)
-- **Side-channel attack** mitigations beyond constant-time scalar math
-- **Supply chain verification**
-- **Production-grade UI** — a single BOOT button + serial log is enough to enforce the per-output confirmation invariant, but a real device would have a dedicated screen and dedicated approve/cancel buttons
-
-What this PoC **does** implement correctly:
-
-- **PIN-sealed mnemonic at rest** (audit H-5) — AES-256-CTR + HMAC-SHA256 Encrypt-then-MAC, key from PBKDF2-HMAC-SHA512 (150 000 iterations, ~1 s on this target). Lockout state counts consecutive failures; 10 in a row wipes the seed + identity scalar. The unsealed mnemonic lives only in a static RAM buffer cleared on lock.
-- **Device identity + attestation** (audit M1) — long-term Pallas keypair generated at first boot, regenerated on wipe. The companion (or a separate trusted CLI) pins `device_pubkey` and re-attests at every signing session to catch device substitution.
-- **Constant-time scalar multiplication** — Montgomery ladder, no branching on secret bits
-- **Constant-time AES-256** (audit H-3) — FF1 diversifier derivation uses the library's bit-sliced `aes_ct` AES; an override at boot redirects to the ESP32-S2 HW AES peripheral (also constant-time, faster). A FIPS-197 §C.3 known-answer self-test runs at boot for the software fallback.
-- **Sinsemilla S-table integrity** (audit M-5) — verified at boot against the library's canonical BLAKE2b-256 fingerprint; on mismatch the device refuses to operate.
-- **Immediate zeroing of all cryptographic intermediates** (`memzero()`)
-- **Hardware RNG** — `bootloader_random_enable()` enabled for the lifetime of the firmware (ESP32-S2 needs this when WiFi/BT is off); used for mnemonic generation, AEAD nonces, identity scalar, and RedPallas nonce hedging.
-- **Spending key never leaves the device** — only FVK and UA are exported
-- **ZIP-244 on-device sighash verification** — `header_digest` and `orchard_digest` recomputed from streamed action data; `transparent_sig_digest` recomputed from streamed transparent inputs/outputs via `orchard_signer_verify_transparent` (or empty-bundle constant when no transparent components); `sapling_digest` enforced equal to the ZIP-244 empty-bundle constant on `TxMeta` receipt (non-empty values abort with `SIGNER_ERR_SAPLING_NOT_EMPTY` before any action data is hashed). No part of the sighash is taken on faith from the companion.
-- **Per-action NoteCommitment recomputation** — for every Orchard action, the device recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` from the unencrypted note plaintext (`recipient`, `value`, `rseed`) the companion declares, and rejects mismatches with `SIGNER_ERR_NOTE_COMMITMENT_MISMATCH`. Closes the recipient-substitution attack a hostile companion would otherwise mount inside the Orchard bundle.
-- **Per-output user confirmation as a state-machine invariant** — `orchard_signer_verify()` refuses to advance to `SIGNER_VERIFIED` unless every action has been explicitly confirmed via `orchard_signer_confirm_action()`, and `orchard_signer_sign()` refuses with `NOT_VERIFIED` unless the state is `VERIFIED`. The firmware drives the confirmation loop (CDC log + BOOT-button press per output) but cannot bypass the lib's check; a build that skipped the UI would still be unable to extract a signature. This is the "no blind signing" guarantee, expressed as a C-library invariant.
-- **SIGN_REQ recipient cross-check** — the UA the companion advertises in `SIGN_REQ.recipient` is decoded on-device via `orchard_decode_ua_orchard_receiver` and compared in constant time against the recipients of the confirmed actions; a hostile companion that lies to its host UI is caught by this check.
-- **Orchard-only by design** — no Sapling keys derived, no Sapling notes ever held, no Sapling-only recipients accepted. The Sapling-component lockout is a structural fit of the wallet, not an arbitrary restriction.
-- **Build hardening** — stack canaries (`-fstack-protector-strong`), heap poisoning (light), GDB stub disabled, OTA anti-rollback armed, WiFi/BT components stripped from the binary (verify via `idf.py size-components`).
+- Ported to the library's November 2026 signer API: the device's full viewing key is passed to
+  `orchard_signer_feed_meta()`; outputs are read with `orchard_signer_get_output()` and labelled
+  by on-device ownership; `orchard_signer_get_totals()` / `orchard_signer_confirm_totals()` add a
+  totals step with its own confirmation.
+- **The previous revision could not sign.** At 3765ea5 the firmware never called the fee
+  confirmation that library a55d168 already required, so `orchard_signer_verify()` returned
+  `SIGNER_ERR_FEE_NOT_CONFIRMED` for every transaction and the device answered the sighash
+  sentinel with "sighash verify failed". (Found by reading the code; not reproduced on a board.)
+- Removed: transparent-input handling, the `TRANSPARENT_SIGN_REQ` ECDSA handler, BIP-32
+  transparent key derivation, `wallet_get_seed()`, and the secp256k1 / BIP-32 sources from the
+  build.
+- Transparent outputs are now printed in the review (they were hashed but never shown).
+- The network is fixed at build time; it used to be whatever coin type the host sent in
+  `FVK_REQ`.
+- `SIGN_REQ.recipient`, amount and fee are no longer read (the library function that
+  cross-checked the recipient was removed because it could match an address no review had
+  shown).
+- Action frames must arrive in order; the compact (no-memo) action body is refused; every error
+  resets the session; at most one signature per action.
+- The cached default address moved to a new NVS key, so an address derived by the pre-fix
+  library is not served from the cache any more.
 
 ## License
 
