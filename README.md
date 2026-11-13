@@ -7,7 +7,7 @@
 
 > **Status (November 2026).** Ported to the November 2026 library API (on-device change
 > detection, totals confirmation, transparent signing removed). The firmware **builds** with
-> ESP-IDF v5.3 against library commit `65a8425` (the submodule pin), with no compiler warnings
+> ESP-IDF v5.3 against library commit `c2f09bf` (the submodule pin), with no compiler warnings
 > in the application or library components. It has **not been flashed or run since the port**: everything below
 > about behaviour on the board describes what the code does, not something observed.
 > The previous revision (3765ea5, library a55d168) could not complete a signature at all — see
